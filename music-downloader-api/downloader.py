@@ -193,18 +193,20 @@ class MusicDownloader:
             res_type, res_id = spotify_manager.parse_spotify_link(query_or_url)
             tracks_to_download: List[TrackMetadata] = []
 
+            playlist_name = None
             if res_type == "track" and res_id and spotify_manager.is_configured:
                 meta = spotify_manager.get_track_metadata(res_id)
                 tracks_to_download.append(meta)
                 task_manager.update_task(task_id, total_tracks=1)
 
             elif res_type == "album" and res_id and spotify_manager.is_configured:
-                _, album_tracks = spotify_manager.get_album_tracks(res_id)
+                alb_info, album_tracks = spotify_manager.get_album_tracks(res_id)
                 tracks_to_download.extend(album_tracks)
                 task_manager.update_task(task_id, total_tracks=len(album_tracks))
 
             elif res_type == "playlist" and res_id and spotify_manager.is_configured:
-                _, pl_tracks = spotify_manager.get_playlist_tracks(res_id)
+                pl_info, pl_tracks = spotify_manager.get_playlist_tracks(res_id)
+                playlist_name = pl_info.get("name")
                 tracks_to_download.extend(pl_tracks)
                 task_manager.update_task(task_id, total_tracks=len(pl_tracks))
 
@@ -244,6 +246,21 @@ class MusicDownloader:
                 saved_file = self.download_track(track_meta, audio_format=audio_format, force=force)
                 created_files.append(saved_file)
                 task_manager.update_task(task_id, completed_tracks=idx, added_file=saved_file)
+
+            # Jeśli to była playlista, utwórz plik .m3u8 w /music/Playlists/
+            if res_type == "playlist" and playlist_name and created_files:
+                pl_dir = os.path.join(self.music_dir, "Playlists")
+                os.makedirs(pl_dir, exist_ok=True)
+                pl_path = os.path.join(pl_dir, f"{sanitize_filename(playlist_name)}.m3u8")
+                try:
+                    with open(pl_path, "w", encoding="utf-8") as f:
+                        f.write("#EXTM3U\n")
+                        for cf in created_files:
+                            rel_path = os.path.relpath(cf, pl_dir)
+                            f.write(f"{rel_path}\n")
+                    logger.info(f"Utworzono plik playlisty M3U8: {pl_path}")
+                except Exception as pe:
+                    logger.warning(f"Nie udało się utworzyć pliku playlisty: {pe}")
 
             # Uruchomienie natychmiastowego reskanu biblioteki w Navidrome
             logger.info("Wyzwalanie automatycznego reskanu Navidrome...")
