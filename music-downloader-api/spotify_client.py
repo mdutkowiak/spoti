@@ -148,11 +148,13 @@ class SpotifyManager:
 
     def get_track_metadata(self, track_id: str) -> TrackMetadata:
         if self.sp:
-            try:
-                track_data = self.sp.track(track_id)
-                return self._format_track_item(track_data)
-            except Exception as e:
-                logger.warning(f"Błąd pobierania utworu przez Spotify API ({e}), próba fallbacku...")
+            for mkt in [settings.SPOTIFY_MARKET, "US", None]:
+                try:
+                    track_data = self.sp.track(track_id, market=mkt)
+                    if track_data and track_data.get("id"):
+                        return self._format_track_item(track_data)
+                except Exception as e:
+                    logger.debug(f"sp.track({track_id}, market={mkt}) nie powiodło się: {e}")
 
         entity = self._extract_entity_from_embed("track", track_id)
         title = entity.get("name") or entity.get("title") or "Unknown Title"
@@ -182,27 +184,28 @@ class SpotifyManager:
 
     def get_album_tracks(self, album_id: str) -> Tuple[Dict[str, Any], List[TrackMetadata]]:
         if self.sp:
-            try:
-                album = self.sp.album(album_id)
-                tracks_res = self.sp.album_tracks(album_id, limit=50)
-                items = tracks_res.get("items", [])
-                
-                while tracks_res.get("next"):
-                    tracks_res = self.sp.next(tracks_res)
-                    items.extend(tracks_res.get("items", []))
+            for mkt in [settings.SPOTIFY_MARKET, "US", None]:
+                try:
+                    album = self.sp.album(album_id, market=mkt)
+                    tracks_res = self.sp.album_tracks(album_id, limit=50, market=mkt)
+                    items = tracks_res.get("items", [])
+                    
+                    while tracks_res.get("next"):
+                        tracks_res = self.sp.next(tracks_res)
+                        items.extend(tracks_res.get("items", []))
 
-                result_tracks = [self._format_track_item(it, album_data=album) for it in items]
-                album_info = {
-                    "id": album.get("id"),
-                    "name": album.get("name"),
-                    "artists": [a.get("name") for a in album.get("artists", [])],
-                    "release_date": album.get("release_date"),
-                    "total_tracks": album.get("total_tracks", len(result_tracks)),
-                    "cover_url": album.get("images", [{}])[0].get("url") if album.get("images") else None
-                }
-                return album_info, result_tracks
-            except Exception as e:
-                logger.warning(f"Błąd pobierania albumu przez Spotify API ({e}), próba fallbacku...")
+                    result_tracks = [self._format_track_item(it, album_data=album) for it in items]
+                    album_info = {
+                        "id": album.get("id"),
+                        "name": album.get("name"),
+                        "artists": [a.get("name") for a in album.get("artists", [])],
+                        "release_date": album.get("release_date"),
+                        "total_tracks": album.get("total_tracks", len(result_tracks)),
+                        "cover_url": album.get("images", [{}])[0].get("url") if album.get("images") else None
+                    }
+                    return album_info, result_tracks
+                except Exception as e:
+                    logger.debug(f"sp.album({album_id}, market={mkt}) błąd: {e}")
 
         entity = self._extract_entity_from_embed("album", album_id)
         alb_name = entity.get("name") or entity.get("title") or "Album"
@@ -252,26 +255,28 @@ class SpotifyManager:
 
         # 1. Próba przez Spotipy API (jeśli dozwolone)
         if self.sp:
-            try:
-                tracks_res = self.sp.playlist_items(playlist_id, limit=50)
-                items = tracks_res.get("items", []) if tracks_res else []
-                while tracks_res and tracks_res.get("next"):
-                    tracks_res = self.sp.next(tracks_res)
-                    items.extend(tracks_res.get("items", []))
+            for mkt in [settings.SPOTIFY_MARKET, "US", None]:
+                try:
+                    tracks_res = self.sp.playlist_items(playlist_id, limit=50, market=mkt)
+                    items = tracks_res.get("items", []) if tracks_res else []
+                    while tracks_res and tracks_res.get("next"):
+                        tracks_res = self.sp.next(tracks_res)
+                        items.extend(tracks_res.get("items", []))
 
-                for item_wrapper in items:
-                    track = item_wrapper.get("track")
-                    if track and track.get("id") and not track.get("is_local"):
-                        result_tracks.append(self._format_track_item(track))
+                    for item_wrapper in items:
+                        track = item_wrapper.get("track")
+                        if track and track.get("id") and not track.get("is_local"):
+                            result_tracks.append(self._format_track_item(track))
 
-                if result_tracks:
-                    pl = self.sp.playlist(playlist_id)
-                    pl_name = pl.get("name")
-                    pl_owner = pl.get("owner", {}).get("display_name")
-                    pl_cover = pl.get("images", [{}])[0].get("url") if pl.get("images") else None
-            except Exception as e:
-                logger.info(f"Spotipy API nie zwróciło utworów playlisty ({e}), używam Spotify Embed Scraper...")
-                result_tracks = []
+                    if result_tracks:
+                        pl = self.sp.playlist(playlist_id, market=mkt)
+                        pl_name = pl.get("name")
+                        pl_owner = pl.get("owner", {}).get("display_name")
+                        pl_cover = pl.get("images", [{}])[0].get("url") if pl.get("images") else None
+                        break
+                except Exception as e:
+                    logger.debug(f"sp.playlist_items(market={mkt}) nie powiodło się: {e}")
+                    result_tracks = []
 
         # 2. Bezpieczny fallback: Spotify Embed
         if not result_tracks:
@@ -296,13 +301,19 @@ class SpotifyManager:
                 logger.info(f"Wzbogacanie metadanych dla {len(track_ids)} utworów przez Spotify Web API (sp.tracks)...")
                 for i in range(0, len(track_ids), 50):
                     batch = track_ids[i:i + 50]
-                    try:
-                        resp = self.sp.tracks(batch)
-                        for t_obj in resp.get("tracks", []):
-                            if t_obj and t_obj.get("id"):
-                                enriched_map[t_obj["id"]] = self._format_track_item(t_obj)
-                    except Exception as be:
-                        logger.warning(f"Błąd batch-pobierania metadanych Spotify ({be})")
+                    # Przeszukaj z rynkiem PL, potem US, potem bez rynku aby żaden utwór nie zwrócił null
+                    for mkt in [settings.SPOTIFY_MARKET, "US", None]:
+                        try:
+                            resp = self.sp.tracks(batch, market=mkt)
+                            candidates = [t for t in resp.get("tracks", []) if t and t.get("id")]
+                            for t_obj in candidates:
+                                if t_obj["id"] not in enriched_map:
+                                    enriched_map[t_obj["id"]] = self._format_track_item(t_obj)
+                            # Jeśli wszystkie z batcha zostały wzbogacone, przejdź do następnego
+                            if len(candidates) == len(batch):
+                                break
+                        except Exception as be:
+                            logger.warning(f"Błąd batch-pobierania metadanych Spotify dla rynku {mkt}: {be}")
 
             for idx, t in enumerate(track_list, 1):
                 uri = t.get("uri", "")

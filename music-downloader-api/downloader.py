@@ -119,6 +119,94 @@ class MusicDownloader:
 
         return False
 
+    def _find_best_youtube_match(self, metadata: TrackMetadata) -> str:
+        """
+        Inteligentnie wybiera czyste studyjne audio z YouTube:
+        1. Finałowy priorytet dla kanałów dystrybucyjnych '... - Topic' (YouTube Music official audio bez wstawek i dialogów).
+        2. Porównanie czasu trwania z metadanymi ze Spotify (odrzuca przydługie teledyski ze skitami/wstępami filmowymi).
+        3. Kary dla wersji 'Music Video', 'MV', 'Short Film', 'Live' i 'Cover'.
+        """
+        search_query = f"{metadata.artist} - {metadata.title}"
+        target_sec = (metadata.duration_ms / 1000) if metadata.duration_ms > 0 else None
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                res = ydl.extract_info(f"ytsearch5:{search_query}", download=False)
+                entries = res.get("entries", []) if res else []
+
+            if not entries:
+                return f"ytsearch1:{search_query}"
+
+            best_entry = None
+            best_score = -9999.0
+
+            for entry in entries:
+                if not entry:
+                    continue
+                score = 100.0
+                cand_title = (entry.get("title") or "").lower()
+                cand_channel = (entry.get("channel") or entry.get("uploader") or "").lower()
+                cand_duration = entry.get("duration")
+
+                # 1. Zgodność czasu trwania z wersją ze Spotify
+                if target_sec and cand_duration:
+                    diff = abs(cand_duration - target_sec)
+                    if diff <= 2.5:
+                        score += 50.0  # Dokładne dopasowanie czasu z masterem albumu
+                    elif diff <= 6.0:
+                        score += 20.0
+                    elif diff > 15.0:
+                        score -= 50.0  # Prawdopodobne intro/outro fabularne lub wersja skrócona
+                    elif diff > 40.0:
+                        score -= 100.0
+
+                # 2. Kanał dystrybucyjny Topic (czysty zapis audio ze Spotify/Apple Music na YT)
+                if cand_channel.endswith("- topic") or "topic" in cand_channel:
+                    score += 80.0
+
+                # 3. Oficjalne oznaczenia audio
+                if "official audio" in cand_title or "audio" in cand_title:
+                    score += 30.0
+
+                # Kary dla teledysków i wersji filmowych z rozmowami/odgłosami
+                if "music video" in cand_title or "official video" in cand_title or " mv " in f" {cand_title} ":
+                    score -= 35.0
+                if "short film" in cand_title or "movie" in cand_title or "skit" in cand_title:
+                    score -= 60.0
+                if "live" in cand_title and "live" not in metadata.title.lower():
+                    score -= 50.0
+                if "cover" in cand_title and "cover" not in metadata.title.lower():
+                    score -= 80.0
+                if "remix" in cand_title and "remix" not in metadata.title.lower():
+                    score -= 40.0
+
+                if score > best_score:
+                    best_score = score
+                    best_entry = entry
+
+            if best_entry and best_entry.get("id"):
+                chosen_id = best_entry.get("id")
+                chosen_title = best_entry.get("title")
+                chosen_channel = best_entry.get("channel") or best_entry.get("uploader")
+                chosen_dur = best_entry.get("duration")
+                logger.info(
+                    f"Wybrano czyste audio dla '{metadata.artist} - {metadata.title}': "
+                    f"'{chosen_title}' [{chosen_channel}] ({chosen_dur}s, score: {best_score:.1f})"
+                )
+                return f"https://www.youtube.com/watch?v={chosen_id}"
+
+        except Exception as e:
+            logger.warning(f"Błąd inteligentnego dopasowania YouTube ({e}), fallback...")
+
+        return f"ytsearch1:{search_query}"
+
     def download_track(
         self,
         metadata: TrackMetadata,
@@ -142,9 +230,9 @@ class MusicDownloader:
             if self._download_via_slskd(metadata, target_file):
                 logger.info("Zadanie FLAC przekazane do SLSKD.")
 
-        # Pobieranie przez yt-dlp ze strumienia YouTube/YouTube Music
-        search_query = f"ytsearch1:{metadata.artist} - {metadata.title}"
-        temp_id = f"dl_{metadata.spotify_id or abs(hash(search_query))}"
+        # Inteligentny wybór źródła (preferuje czyste audio z Topic / bez skitów)
+        youtube_source = self._find_best_youtube_match(metadata)
+        temp_id = f"dl_{metadata.spotify_id or abs(hash(metadata.artist + metadata.title))}"
         temp_out_tmpl = os.path.join(self.temp_dir, f"{temp_id}.%(ext)s")
         temp_expected_file = os.path.join(self.temp_dir, f"{temp_id}.{ext}")
 
@@ -152,13 +240,13 @@ class MusicDownloader:
 
         logger.info(f"Pobieranie audio: '{metadata.artist} - {metadata.title}' -> {audio_format}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([search_query])
+            ydl.download([youtube_source])
 
         if not os.path.exists(temp_expected_file):
             # Poszukaj czy plik ma inne rozszerzenie
             candidates = [os.path.join(self.temp_dir, f) for f in os.listdir(self.temp_dir) if f.startswith(temp_id)]
             if not candidates:
-                raise RuntimeError(f"Nie odnaleziono pobranego pliku dla zapytania: {search_query}")
+                raise RuntimeError(f"Nie odnaleziono pobranego pliku dla źródła: {youtube_source}")
             temp_expected_file = candidates[0]
 
         # Tagowanie metadanymi i okładką

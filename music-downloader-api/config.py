@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     # Spotify Web API Credentials
     SPOTIFY_CLIENT_ID: str = Field(default="", description="Spotify Client ID z developer.spotify.com")
     SPOTIFY_CLIENT_SECRET: str = Field(default="", description="Spotify Client Secret")
+    SPOTIFY_MARKET: str = Field(default="PL", description="Rynek Spotify dla dostępności utworów (np. PL, US)")
     
     # Preferencje audio
     DEFAULT_AUDIO_FORMAT: str = Field(default="opus", description="Domyślny format: opus, mp3, flac")

@@ -385,7 +385,7 @@ def web_dashboard():
         <input type="text" id="queryInput" placeholder="np. https://open.spotify.com/track/... lub Queen - Bohemian Rhapsody">
       </div>
       
-      <div style="display: flex; gap: 1rem; margin-bottom: 1.2rem;">
+      <div style="display: flex; gap: 1rem; margin-bottom: 0.8rem;">
         <div style="flex: 1;">
           <label for="formatSelect">Format wyjściowy:</label>
           <select id="formatSelect">
@@ -394,6 +394,13 @@ def web_dashboard():
             <option value="flac">FLAC (Bezstratny)</option>
           </select>
         </div>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 0.6rem; margin-bottom: 1.2rem;">
+        <input type="checkbox" id="forceCheck" style="width: auto; cursor: pointer;">
+        <label for="forceCheck" style="margin-bottom: 0; cursor: pointer; color: var(--text-muted); font-size: 0.88rem;">
+          Wymuś ponowne pobranie i nadpisanie plików (odświeża okładki albumów i zastępuje skity czystym audio)
+        </label>
       </div>
 
       <div class="btn-row">
@@ -418,6 +425,7 @@ def web_dashboard():
     async function startDownload(customQuery = null) {
       const q = customQuery || document.getElementById('queryInput').value.trim();
       const format = document.getElementById('formatSelect').value;
+      const force = document.getElementById('forceCheck').checked;
       const statusBox = document.getElementById('statusBox');
 
       if (!q) {
@@ -432,7 +440,7 @@ def web_dashboard():
         const res = await fetch('/download', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ query_or_url: q, format: format, force: false })
+          body: JSON.stringify({ query_or_url: q, format: format, force: force })
         });
         const data = await res.json();
         if (res.ok) {
