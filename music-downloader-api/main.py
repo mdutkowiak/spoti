@@ -279,7 +279,7 @@ def web_dashboard():
     """
     Wbudowany, responsywny web UI do wyszukiwania, wklejania linków i pobierania on-demand.
     """
-    html_content = """<!DOCTYPE html>
+    html_content = r"""<!DOCTYPE html>
 <html lang="pl">
 <head>
   <meta charset="UTF-8">
@@ -638,7 +638,20 @@ def web_dashboard():
   </div>
 
   <script>
-    document.getElementById("navidromeLink").href = "http://" + window.location.hostname + ":4533";
+    // Globalny łapacz błędów JavaScript
+    window.onerror = function(msg, url, lineNo, columnNo, error) {
+      const sb = document.getElementById("statusBox");
+      if (sb) {
+        sb.style.display = "block";
+        sb.innerHTML = `<span style="color: #ef4444;">❌ Błąd interfejsu (linia ${lineNo}): ${msg}</span>`;
+      }
+      return false;
+    };
+
+    const isProxied = window.location.pathname.startsWith('/dl');
+    const API_BASE = isProxied ? '/dl' : '';
+    const navidromeUrl = isProxied ? (window.location.origin + '/') : ('http://' + window.location.hostname + ':4533');
+    document.getElementById("navidromeLink").href = navidromeUrl;
 
     let currentInspectedTracks = [];
     let currentPlaylistName = "";
@@ -676,7 +689,7 @@ def web_dashboard():
       inspCard.style.display = "none";
 
       try {
-        const res = await fetch('/inspect', {
+        const res = await fetch(`${API_BASE}/inspect`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url_or_query: q })
@@ -812,7 +825,7 @@ def web_dashboard():
       statusBox.scrollIntoView({ behavior: 'smooth' });
 
       try {
-        const res = await fetch('/download-selected', {
+        const res = await fetch(`${API_BASE}/download-selected`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -845,7 +858,7 @@ def web_dashboard():
       statusBox.scrollIntoView({ behavior: 'smooth' });
 
       try {
-        const res = await fetch('/download-selected', {
+        const res = await fetch(`${API_BASE}/download-selected`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -883,7 +896,7 @@ def web_dashboard():
       statusBox.scrollIntoView({ behavior: 'smooth' });
 
       try {
-        const res = await fetch('/download', {
+        const res = await fetch(`${API_BASE}/download`, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ query_or_url: q, format: format, force: force })
@@ -904,7 +917,7 @@ def web_dashboard():
       const statusBox = document.getElementById('statusBox');
       const interval = setInterval(async () => {
         try {
-          const res = await fetch(`/tasks/${taskId}`);
+          const res = await fetch(`${API_BASE}/tasks/${taskId}`);
           const task = await res.json();
           if (task.status === 'processing') {
             statusBox.innerHTML = `⚙️ <b>Pobieranie w toku:</b> ${task.current_track || ''} (${task.completed_tracks}/${task.total_tracks})`;
@@ -937,7 +950,7 @@ def web_dashboard():
       inspCard.style.display = "none";
       resultsContainer.innerHTML = "<div style='color: var(--text-muted); padding: 0.5rem;'>⏳ Przeszukiwanie katalogu Spotify...</div>";
       try {
-        const res = await fetch(`/search?q=${encodeURIComponent(q)}&type=${type}&limit=8`);
+        const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(q)}&type=${type}&limit=8`);
         const data = await res.json();
         resultsContainer.innerHTML = "";
 
@@ -992,7 +1005,7 @@ def web_dashboard():
 
     // --- CZYSZCZENIE I ODŚWIEŻANIE BIBLIOTEKI ---
     async function clearLibrary() {
-      const confirmed = confirm("⚠️ UWAGA: Czy na pewno chcesz całkowicie usunąć WSZYSTKIE pliki muzyczne z biblioteki na serwerze?\n\nOperacja usunie wszystkie pobrane utwory, okładki i playlisty z dysku, a następnie zresetuje bazę Navidrome.\nTwoje konto i ustawienia Navidrome zostaną ZACHOWANE.");
+      const confirmed = confirm("Czy na pewno chcesz usunąć wszystkie utwory z biblioteki i zacząć od nowa? Operacja usunie pliki z dysku i zresetuje bazę Navidrome.");
       if (!confirmed) return;
 
       const statusBox = document.getElementById('statusBox');
@@ -1001,7 +1014,7 @@ def web_dashboard():
       statusBox.scrollIntoView({ behavior: 'smooth' });
 
       try {
-        const res = await fetch('/library/clear', { method: 'POST' });
+        const res = await fetch(`${API_BASE}/library/clear`, { method: 'POST' });
         const data = await res.json();
         if (res.ok) {
           statusBox.innerHTML = `✅ <b>Biblioteka została wyczyszczona!</b> Usunięto ${data.deleted_count} elementów. Navidrome ma teraz czystą bazę.`;
@@ -1021,7 +1034,7 @@ def web_dashboard():
       statusBox.innerHTML = "Wysyłanie sygnału reskanu do Navidrome...";
       statusBox.scrollIntoView({ behavior: 'smooth' });
       try {
-        const res = await fetch('/refresh-navidrome', { method: 'POST' });
+        const res = await fetch(`${API_BASE}/refresh-navidrome`, { method: 'POST' });
         const data = await res.json();
         statusBox.innerHTML = `🔄 Sygnał reskanu wysłany: ${data.status}`;
       } catch (err) {
