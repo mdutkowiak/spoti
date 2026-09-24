@@ -12,6 +12,7 @@ from spotify_client import spotify_manager, TrackMetadata, inspect_url
 from downloader import downloader
 from navidrome_client import navidrome_client
 from tasks import task_manager, TaskInfo, TaskStatus
+from library_checker import library_checker
 
 # Konfiguracja logowania
 logging.basicConfig(
@@ -99,6 +100,9 @@ def search_music(
     """
     try:
         results = spotify_manager.search(query=q, search_type=type, limit=limit)
+        if type == "track":
+            for item in results:
+                item["in_library"] = library_checker.contains(item.get("artist", ""), item.get("title", ""))
         return {"query": q, "type": type, "count": len(results), "results": results}
     except Exception as e:
         logger.error(f"Błąd wyszukiwania: {e}")
@@ -113,6 +117,8 @@ def inspect_media_link(req: InspectRequest, _: bool = Depends(verify_api_key)):
     """
     try:
         data = inspect_url(req.url_or_query)
+        for t in data.get("tracks", []):
+            t["in_library"] = library_checker.contains(t.get("artist", ""), t.get("title", ""))
         return data
     except Exception as e:
         logger.error(f"Błąd inspekcji linku {req.url_or_query}: {e}")
@@ -201,6 +207,7 @@ def clear_music_library(_: bool = Depends(verify_api_key)):
             except Exception as e:
                 logger.error(f"Błąd usuwania {item_path}: {e}")
 
+    library_checker.invalidate()
     res = navidrome_client.trigger_scan(full_scan=True)
     return {
         "status": "success",
@@ -538,6 +545,40 @@ def web_dashboard():
       object-fit: cover;
       flex-shrink: 0;
     }
+    .version-item .download-small-btn {
+      flex: 0 0 auto !important;
+      width: max-content !important;
+      margin-left: auto !important;
+      padding: 0.45rem 0.85rem !important;
+      font-size: 0.82rem !important;
+      white-space: nowrap !important;
+    }
+    .badge-in-library {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      color: #ef4444;
+      font-weight: 700;
+      font-size: 0.78rem;
+      background: rgba(239, 68, 68, 0.15);
+      padding: 3px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(239, 68, 68, 0.4);
+      white-space: nowrap;
+    }
+    .badge-duration {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      font-size: 0.8rem;
+      color: #38bdf8;
+      font-weight: 600;
+      background: rgba(56, 189, 248, 0.12);
+      padding: 3px 7px;
+      border-radius: 6px;
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      white-space: nowrap;
+    }
     .btn-search-version {
       background: #334155;
       color: #f8fafc;
@@ -722,6 +763,14 @@ def web_dashboard():
       return String(text).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     }
 
+    function formatDuration(ms) {
+      if (!ms || ms <= 0) return '';
+      const totalSeconds = Math.round(ms / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${minutes}:${seconds < 10 ? '0' : ''}${seconds}`;
+    }
+
     function handlePrimaryAction() {
       const q = document.getElementById('queryInput').value.trim();
       if (!q) return;
@@ -796,9 +845,14 @@ def web_dashboard():
         div.className = 'track-row';
         div.id = `track-row-${idx}`;
         div.style.cssText = "display: flex; flex-direction: column; align-items: stretch; gap: 0.5rem; padding: 0.8rem; background: #1e293b; border-radius: 8px; border: 1px solid var(--border);";
+
+        const durStr = formatDuration(t.duration_ms);
+        const inLib = Boolean(t.in_library);
+        const isChecked = !inLib;
+
         div.innerHTML = `
           <div style="display: flex; align-items: center; gap: 0.7rem; width: 100%; flex-wrap: wrap;">
-            <input type="checkbox" id="check-${idx}" style="width: 20px; height: 20px; cursor: pointer;" checked onchange="updateSelectedCounter()">
+            <input type="checkbox" id="check-${idx}" style="width: 20px; height: 20px; cursor: pointer;" ${isChecked ? 'checked' : ''} onchange="updateSelectedCounter()">
             <span style="color: var(--text-muted); font-size: 0.85rem; font-weight: 700; width: 30px; text-align: right; flex-shrink: 0;">#${idx + 1}</span>
             <div style="flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; min-width: 240px;">
               <div>
@@ -810,12 +864,14 @@ def web_dashboard():
                 <input type="text" id="artist-${idx}" class="input-compact" value="${escapeHtml(t.artist)}">
               </div>
             </div>
-            <div style="display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0;">
+            ${durStr ? `<span class="badge-duration" title="Długość utworu">⏱️ ${durStr}</span>` : ''}
+            ${inLib ? `<span class="badge-in-library" title="Ten utwór został już znaleziony w lokalnej bibliotece">⚠️ Ten utwór już jest w bazie</span>` : ''}
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; margin-left: auto;">
               <button class="btn-search-version" id="search-btn-${idx}" onclick="lookupTrackVersions(${idx})" title="Wyszukaj ten utwór w katalogu, zobacz oficjalne albumy i wybierz wersję">
                 🔍 Wybierz wersję
               </button>
-              <button class="download-small-btn" id="dl-btn-${idx}" onclick="downloadSingleTrackFromList(${idx})" title="Pobierz ten utwór z oficjalnymi metadanymi">
-                ⬇️ Pobierz
+              <button class="download-small-btn" id="dl-btn-${idx}" onclick="downloadSingleTrackFromList(${idx})" title="Pobierz ten utwór z oficjalnymi metadanymi" style="width: max-content; flex: 0 0 auto;">
+                ${inLib ? '⬇️ Pobierz ponownie' : '⬇️ Pobierz'}
               </button>
             </div>
           </div>
@@ -874,18 +930,24 @@ def web_dashboard():
             ${data.results.map(item => {
               const q = item.spotify_url || (item.artist + ' - ' + item.title);
               const encQ = encodeURIComponent(q);
+              const durStr = formatDuration(item.duration_ms);
+              const inLib = Boolean(item.in_library);
               return `
               <div class="version-item">
-                <div style="display: flex; align-items: center; gap: 0.7rem; min-width: 0;">
+                <div style="display: flex; align-items: center; gap: 0.7rem; min-width: 0; flex: 1;">
                   <img src="${item.cover_url || 'https://via.placeholder.com/44'}" alt="cover">
-                  <div style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    <div style="font-weight: 600; font-size: 0.88rem; color: #fff;">${escapeHtml(item.title)}</div>
-                    <div style="font-size: 0.78rem; color: var(--text-muted);">
+                  <div style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                      <span style="font-weight: 600; font-size: 0.88rem; color: #fff;">${escapeHtml(item.title)}</span>
+                      ${durStr ? `<span class="badge-duration" style="font-size: 0.75rem; padding: 2px 6px;">⏱️ ${durStr}</span>` : ''}
+                      ${inLib ? `<span class="badge-in-library" style="font-size: 0.75rem; padding: 2px 6px;">⚠️ Ten utwór już jest w bazie</span>` : ''}
+                    </div>
+                    <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis;">
                       ${escapeHtml(item.artist)} • <b style="color: #cbd5e1;">${escapeHtml(item.album)}</b> (${escapeHtml(item.year || '')})
                     </div>
                   </div>
                 </div>
-                <button class="download-small-btn" onclick="downloadVersionFromList(${idx}, decodeURIComponent('${encQ}'))" style="flex-shrink: 0;">
+                <button class="download-small-btn" onclick="downloadVersionFromList(${idx}, decodeURIComponent('${encQ}'))" style="flex: 0 0 auto; width: max-content; margin-left: auto; padding: 0.45rem 0.85rem; font-size: 0.82rem; white-space: nowrap;">
                   ⬇️ Pobierz tę wersję
                 </button>
               </div>
@@ -1105,13 +1167,21 @@ def web_dashboard():
             div.className = 'track-item';
             
             if (type === 'track') {
+              const durStr = formatDuration(item.duration_ms);
+              const inLib = Boolean(item.in_library);
               div.innerHTML = `
                 <img src="${item.cover_url || 'https://via.placeholder.com/64'}" alt="cover">
                 <div class="track-info">
-                  <div class="track-title">${item.title}</div>
-                  <div class="track-artist">${item.artist} • ${item.album} (${item.year})</div>
+                  <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                    <span class="track-title">${escapeHtml(item.title)}</span>
+                    ${durStr ? `<span class="badge-duration" style="font-size: 0.75rem; padding: 2px 6px;">⏱️ ${durStr}</span>` : ''}
+                    ${inLib ? `<span class="badge-in-library" style="font-size: 0.75rem; padding: 2px 6px;">⚠️ Ten utwór już jest w bazie</span>` : ''}
+                  </div>
+                  <div class="track-artist">${escapeHtml(item.artist)} • ${escapeHtml(item.album)} (${escapeHtml(item.year || '')})</div>
                 </div>
-                <button class="download-small-btn" onclick="startDownload('${item.spotify_url}')">⬇️ Pobierz</button>
+                <button class="download-small-btn" onclick="startDownload('${item.spotify_url || (item.artist + ' - ' + item.title)}')" style="width: max-content; flex: 0 0 auto; margin-left: auto;">
+                  ${inLib ? '⬇️ Pobierz ponownie' : '⬇️ Pobierz'}
+                </button>
               `;
             } else if (type === 'album') {
               const artists = (item.artists || []).join(', ');

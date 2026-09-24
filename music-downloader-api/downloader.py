@@ -13,6 +13,7 @@ from tagger import AudioTagger
 from navidrome_client import navidrome_client
 from telegram_notifier import telegram_notifier
 from tasks import task_manager, TaskStatus
+from library_checker import library_checker
 
 logger = logging.getLogger("music-downloader.engine")
 
@@ -296,6 +297,7 @@ class MusicDownloader:
         # Przeniesienie do katalogu docelowego
         shutil.move(temp_expected_file, target_file)
         logger.info(f"Plik pomyślnie zapisany w bibliotece: {target_file}")
+        library_checker.invalidate()
 
         return target_file
 
