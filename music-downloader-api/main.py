@@ -381,12 +381,23 @@ def web_dashboard():
 
     <div class="card">
       <div class="form-group">
-        <label for="queryInput">Wklej link ze Spotify (utwór/album/playlista) lub wpisz nazwę:</label>
-        <input type="text" id="queryInput" placeholder="np. https://open.spotify.com/track/... lub Queen - Bohemian Rhapsody">
+        <label for="queryInput">Wklej link ze Spotify (utwór/album/playlista) lub wpisz frazę:</label>
+        <div style="display: flex; gap: 0.6rem;">
+          <input type="text" id="queryInput" placeholder="np. https://open.spotify.com/playlist/... lub Dawid Podsiadło" onkeydown="if(event.key==='Enter') searchMusic()">
+          <button class="btn-primary" style="flex: 0 0 auto; width: auto; padding: 0 1.4rem;" onclick="searchMusic()">🔍 Szukaj</button>
+        </div>
       </div>
       
-      <div style="display: flex; gap: 1rem; margin-bottom: 0.8rem;">
-        <div style="flex: 1;">
+      <div style="display: flex; gap: 1rem; margin-bottom: 0.8rem; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 160px;">
+          <label for="searchTypeSelect">Typ wyszukiwania:</label>
+          <select id="searchTypeSelect" onchange="if(document.getElementById('queryInput').value.trim()) searchMusic()">
+            <option value="track" selected>🎵 Utwory</option>
+            <option value="album">💿 Albumy</option>
+            <option value="playlist">📑 Playlisty</option>
+          </select>
+        </div>
+        <div style="flex: 1; min-width: 160px;">
           <label for="formatSelect">Format wyjściowy:</label>
           <select id="formatSelect">
             <option value="opus" selected>Opus ~160 kbps (Zoptymalizowany, wysoka jakość)</option>
@@ -404,8 +415,7 @@ def web_dashboard():
       </div>
 
       <div class="btn-row">
-        <button class="btn-primary" onclick="startDownload()">⬇️ Pobierz do biblioteki</button>
-        <button class="btn-secondary" onclick="searchTracks()">🔍 Szukaj w Spotify</button>
+        <button class="btn-primary" onclick="startDownload()">⬇️ Pobierz wklejony link do biblioteki</button>
         <button class="btn-secondary" onclick="refreshNavidrome()">🔄 Odśwież Navidrome</button>
       </div>
 
@@ -475,36 +485,65 @@ def web_dashboard():
       }, 1500);
     }
 
-    async function searchTracks() {
+    async function searchMusic() {
       const q = document.getElementById('queryInput').value.trim();
+      const type = document.getElementById('searchTypeSelect').value;
       const resultsContainer = document.getElementById('searchResults');
       if (!q) return;
 
-      resultsContainer.innerHTML = "Wyszukiwanie...";
+      // Jeśli wklejono bezpośredni link do Spotify, od razu uruchom pobieranie
+      if (q.includes('open.spotify.com/')) {
+        startDownload(q);
+        return;
+      }
+
+      resultsContainer.innerHTML = "<div style='color: var(--text-muted); padding: 0.5rem;'>⏳ Przeszukiwanie katalogu Spotify...</div>";
       try {
-        const res = await fetch(`/search?q=${encodeURIComponent(q)}&type=track&limit=5`);
+        const res = await fetch(`/search?q=${encodeURIComponent(q)}&type=${type}&limit=8`);
         const data = await res.json();
         resultsContainer.innerHTML = "";
 
         if (data.results && data.results.length > 0) {
-          data.results.forEach(t => {
+          data.results.forEach(item => {
             const div = document.createElement('div');
             div.className = 'track-item';
-            div.innerHTML = `
-              <img src="${t.cover_url || 'https://via.placeholder.com/64'}" alt="cover">
-              <div class="track-info">
-                <div class="track-title">${t.title}</div>
-                <div class="track-artist">${t.artist} • ${t.album} (${t.year})</div>
-              </div>
-              <button class="download-small-btn" onclick="startDownload('${t.spotify_url}')">Pobierz</button>
-            `;
+            
+            if (type === 'track') {
+              div.innerHTML = `
+                <img src="${item.cover_url || 'https://via.placeholder.com/64'}" alt="cover">
+                <div class="track-info">
+                  <div class="track-title">${item.title}</div>
+                  <div class="track-artist">${item.artist} • ${item.album} (${item.year})</div>
+                </div>
+                <button class="download-small-btn" onclick="startDownload('${item.spotify_url}')">⬇️ Pobierz</button>
+              `;
+            } else if (type === 'album') {
+              const artists = (item.artists || []).join(', ');
+              div.innerHTML = `
+                <img src="${item.cover_url || 'https://via.placeholder.com/64'}" alt="cover">
+                <div class="track-info">
+                  <div class="track-title">💿 ${item.name}</div>
+                  <div class="track-artist">${artists} • ${item.total_tracks} utworów (${item.release_date || ''})</div>
+                </div>
+                <button class="download-small-btn" onclick="startDownload('${item.spotify_url}')">⬇️ Pobierz album</button>
+              `;
+            } else if (type === 'playlist') {
+              div.innerHTML = `
+                <img src="${item.cover_url || 'https://via.placeholder.com/64'}" alt="cover">
+                <div class="track-info">
+                  <div class="track-title">📑 ${item.name}</div>
+                  <div class="track-artist">Autor: ${item.owner} • ${item.total_tracks} utworów</div>
+                </div>
+                <button class="download-small-btn" onclick="startDownload('${item.spotify_url}')">⬇️ Pobierz playlistę</button>
+              `;
+            }
             resultsContainer.appendChild(div);
           });
         } else {
-          resultsContainer.innerHTML = "Brak wyników.";
+          resultsContainer.innerHTML = "<div style='color: var(--text-muted); padding: 0.5rem;'>Brak wyników w Spotify.</div>";
         }
       } catch (err) {
-        resultsContainer.innerHTML = `Błąd: ${err}`;
+        resultsContainer.innerHTML = `<div style='color: #ef4444; padding: 0.5rem;'>Błąd połączenia: ${err}</div>`;
       }
     }
 
