@@ -405,6 +405,16 @@ def web_dashboard():
     .btn-secondary:hover {
       background: #475569;
     }
+    .btn-danger-soft {
+      background: #3b1e1e;
+      border: 1px solid #7f1d1d;
+      color: #fca5a5;
+    }
+    .btn-danger-soft:hover {
+      background: #4c1d1d;
+      border-color: #991b1b;
+      color: #fecaca;
+    }
     .status-box {
       margin-top: 1rem;
       padding: 1rem;
@@ -707,9 +717,10 @@ def web_dashboard():
       </div>
 
       <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.8rem; margin-bottom: 1rem;">
-        <div style="display: flex; gap: 0.6rem;">
+        <div style="display: flex; gap: 0.6rem; flex-wrap: wrap;">
           <button class="btn-secondary" style="padding: 0.45rem 0.85rem; font-size: 0.82rem;" onclick="toggleSelectAll(true)">☑️ Zaznacz wszystkie</button>
           <button class="btn-secondary" style="padding: 0.45rem 0.85rem; font-size: 0.82rem;" onclick="toggleSelectAll(false)">⬜ Odznacz wszystkie</button>
+          <button class="btn-secondary btn-danger-soft" style="padding: 0.45rem 0.85rem; font-size: 0.82rem;" onclick="removeDuplicateTracksFromList()" title="Usuwa z widoku kafelki z utworami, które znajdują się już w bazie">🗑️ Usuń duplikaty z bazy</button>
         </div>
         <div style="color: var(--text-muted); font-size: 0.82rem;">
           💡 Lista utworów. Kliknij „🔍 Wybierz wersję”, aby zobaczyć oficjalne albumy i okładki, lub „⬇️ Pobierz”.
@@ -886,6 +897,8 @@ def web_dashboard():
     function updateSelectedCounter() {
       let count = 0;
       currentInspectedTracks.forEach((_, idx) => {
+        const row = document.getElementById(`track-row-${idx}`);
+        if (row && row.style.display === 'none') return;
         const cb = document.getElementById(`check-${idx}`);
         if (cb && cb.checked) count++;
       });
@@ -894,10 +907,30 @@ def web_dashboard():
 
     function toggleSelectAll(checked) {
       currentInspectedTracks.forEach((_, idx) => {
+        const row = document.getElementById(`track-row-${idx}`);
+        if (row && row.style.display === 'none') return;
         const cb = document.getElementById(`check-${idx}`);
         if (cb) cb.checked = checked;
       });
       updateSelectedCounter();
+    }
+
+    function removeDuplicateTracksFromList() {
+      let removedCount = 0;
+      currentInspectedTracks.forEach((t, idx) => {
+        if (t.in_library) {
+          const row = document.getElementById(`track-row-${idx}`);
+          if (row && row.style.display !== 'none') {
+            removeTrackRowWithAnimation(idx);
+            removedCount++;
+          }
+        }
+      });
+      if (removedCount > 0) {
+        showToast(`🗑️ Usunięto z widoku ${removedCount} utworów obecnych w bazie.`);
+      } else {
+        showToast(`ℹ️ Brak utworów do usunięcia (żaden utwór na liście nie jest w bazie).`);
+      }
     }
 
     async function lookupTrackVersions(idx) {
@@ -1009,6 +1042,8 @@ def web_dashboard():
       const selectedTracks = [];
       const selectedIndices = [];
       currentInspectedTracks.forEach((_, idx) => {
+        const row = document.getElementById(`track-row-${idx}`);
+        if (row && row.style.display === 'none') return;
         const cb = document.getElementById(`check-${idx}`);
         if (cb && cb.checked) {
           selectedIndices.push(idx);
