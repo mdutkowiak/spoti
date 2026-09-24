@@ -1,0 +1,28 @@
+api:
+  dashboard: true
+  insecure: false
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: music-net
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "admin@twojadomena.pl"
+      storage: "/letsencrypt/acme.json"
+      httpChallenge:
+        entryPoint: web

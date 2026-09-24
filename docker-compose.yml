@@ -1,0 +1,156 @@
+version: "3.8"
+
+networks:
+  music-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+    driver_opts:
+      com.docker.network.bridge.name: br-music
+
+services:
+  # ============================================================================
+  # NAVIDROME: OpenSubsonic Music Server & Web UI
+  # ============================================================================
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${NAVIDROME_PORT:-4533}:4533"
+    environment:
+      # Podstawowe ścieżki w kontenerze
+      ND_MUSICFOLDER: /music
+      ND_DATAFOLDER: /data
+      ND_LOGLEVEL: "${ND_LOGLEVEL:-info}"
+      ND_SCANSCHEDULE: "${ND_SCANSCHEDULE:-@every 1h}"
+      ND_SESSIONTIMEOUT: "${ND_SESSIONTIMEOUT:-48h}"
+      ND_DEFAULTLANGUAGE: "${ND_DEFAULTLANGUAGE:-pl}"
+      
+      # Wydajność transkodowania i pamięć podręczna
+      ND_ENABLETRANSCODINGCONFIG: "${ND_ENABLETRANSCODINGCONFIG:-true}"
+      ND_TRANSCODINGCACHESIZE: "${ND_TRANSCODINGCACHE_SIZE:-5000MB}"
+      ND_IMAGECACHESIZE: "${ND_IMAGECACHESIZE:-1000MB}"
+      
+      # Integracje i UI
+      ND_ENABLESHARING: "true"
+      ND_ENABLEEXTERNALSERVICES: "true"
+      ND_AUTOIMPORTPLAYLISTS: "true"
+      
+      # Reverse Proxy
+      ND_REVERSEPROXYUSERHEADER: "Remote-User"
+      ND_BASEURL: ""
+    volumes:
+      - "${MUSIC_DIR:-./music}:/music:ro"
+      - "${DATA_DIR:-./data}/navidrome:/data:rw"
+    networks:
+      - music-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4533/ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ============================================================================
+  # MUSIC DOWNLOADER API: On-demand Spotify Metadata + yt-dlp / Opus / FLAC Engine
+  # ============================================================================
+  music-downloader-api:
+    build:
+      context: ./music-downloader-api
+      dockerfile: Dockerfile
+    container_name: music-downloader-api
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    environment:
+      # Konfiguracja środowiskowa
+      TZ: "${TZ:-Europe/Warsaw}"
+      MUSIC_DIR: /music
+      DATA_DIR: /data
+      API_SECRET_KEY: "${API_SECRET_KEY:-}"
+      
+      # Spotify Web API
+      SPOTIFY_CLIENT_ID: "${SPOTIFY_CLIENT_ID}"
+      SPOTIFY_CLIENT_SECRET: "${SPOTIFY_CLIENT_SECRET}"
+      
+      # Audio Engine
+      DEFAULT_AUDIO_FORMAT: "${DEFAULT_AUDIO_FORMAT:-opus}"
+      AUDIO_BITRATE: "${AUDIO_BITRATE:-160k}"
+      
+      # Navidrome Rescan Webhook / API
+      NAVIDROME_URL: "${NAVIDROME_URL:-http://navidrome:4533}"
+      NAVIDROME_ADMIN_USER: "${NAVIDROME_ADMIN_USER:-admin}"
+      NAVIDROME_ADMIN_PASSWORD: "${NAVIDROME_ADMIN_PASSWORD:-}"
+      
+      # SLSKD (Soulseek FLAC fallback)
+      ENABLE_SLSKD: "${ENABLE_SLSKD:-false}"
+      SLSKD_URL: "${SLSKD_URL:-http://slskd:5030}"
+      SLSKD_API_KEY: "${SLSKD_API_KEY:-}"
+      
+      # Webhooks i powiadomienia
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+    volumes:
+      - "${MUSIC_DIR:-./music}:/music:rw"
+      - "${DATA_DIR:-./data}/downloader:/data:rw"
+    depends_on:
+      navidrome:
+        condition: service_healthy
+    networks:
+      - music-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ============================================================================
+  # FEISHIN WEB UI: Interfejs webowy i odtwarzacz w stylu Spotify 1:1
+  # ============================================================================
+  feishin:
+    image: ghcr.io/jeffvli/feishin:latest
+    container_name: feishin
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9180:9180"
+    environment:
+      - SERVER_NAME=SpotiNavi
+      - SERVER_TYPE=navidrome
+      - SERVER_URL=http://navidrome:4533
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-Europe/Warsaw}
+    depends_on:
+      navidrome:
+        condition: service_healthy
+    networks:
+      - music-net
+
+  # ============================================================================
+  # SLSKD (Opcjonalny profil: Soulseek daemon dla bezstratnego FLAC)
+  # Uruchamianie: docker compose --profile flac up -d
+  # ============================================================================
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    profiles: ["flac", "all"]
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: unless-stopped
+    ports:
+      - "5030:5030"     # Web UI i API
+      - "50300:50300"   # Soulseek transfer port
+    environment:
+      SLSKD_REMOTE_CONFIGURATION: "true"
+      SLSKD_APP_DIR: /app
+      SLSKD_SLSK_LISTEN_PORT: 50300
+    volumes:
+      - "${DATA_DIR:-./data}/slskd:/app:rw"
+      - "${MUSIC_DIR:-./music}:/music:rw"
+    networks:
+      - music-net

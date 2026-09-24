@@ -1,0 +1,27 @@
+# Environment files with sensitive credentials
+.env
+.env.local
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Application storage & media (do not commit downloaded music or database)
+music/
+data/
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# SSL certs & logs
+*.log
+acme.json
