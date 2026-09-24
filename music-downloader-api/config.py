@@ -42,6 +42,8 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Upewnienie się, że katalogi istnieją
-os.makedirs(settings.MUSIC_DIR, exist_ok=True)
-os.makedirs(settings.DATA_DIR, exist_ok=True)
-os.makedirs(os.path.join(settings.DATA_DIR, "temp"), exist_ok=True)
+for p in [settings.MUSIC_DIR, settings.DATA_DIR, os.path.join(settings.DATA_DIR, "temp")]:
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
