@@ -36,7 +36,9 @@ app.add_middleware(
 
 # Weryfikacja klucza API (opcjonalna)
 def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    if settings.API_SECRET_KEY and settings.API_SECRET_KEY != x_api_key:
+    if not settings.API_SECRET_KEY or settings.API_SECRET_KEY in ["", "change_this_secret_token_for_api_auth"]:
+        return True
+    if settings.API_SECRET_KEY != x_api_key:
         raise HTTPException(status_code=401, detail="Nieprawidłowy lub brakujący klucz X-API-Key.")
     return True
 
