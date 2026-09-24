@@ -207,6 +207,37 @@ class MusicDownloader:
 
         return f"ytsearch1:{search_query}"
 
+    def _enrich_metadata_from_search(self, artist: str, title: str) -> Optional[TrackMetadata]:
+        """
+        Wyszukuje oficjalne metadane albumu i okładki dla utworu,
+        gdy utwór został przekazany z samej listy/playlisty bez danych albumowych.
+        """
+        query = f"{artist} {title}".strip()
+        try:
+            results = spotify_manager.search(query, search_type="track", limit=1)
+            if results:
+                res = results[0]
+                return TrackMetadata(
+                    spotify_id=res.get("spotify_id") or "",
+                    title=res.get("title") or title,
+                    artists=res.get("artists") or [artist],
+                    artist=res.get("artist") or artist,
+                    album=res.get("album") or "Single",
+                    album_artist=res.get("album_artist") or artist,
+                    track_number=res.get("track_number", 1),
+                    total_tracks=res.get("total_tracks", 1),
+                    disc_number=res.get("disc_number", 1),
+                    release_date=res.get("release_date") or "2026",
+                    year=res.get("year") or "2026",
+                    duration_ms=res.get("duration_ms", 0),
+                    cover_url=res.get("cover_url"),
+                    isrc=res.get("isrc"),
+                    spotify_url=res.get("spotify_url", "")
+                )
+        except Exception as e:
+            logger.warning(f"Nie udało się wzbogacić metadanych dla '{query}': {e}")
+        return None
+
     def download_track(
         self,
         metadata: TrackMetadata,
@@ -218,6 +249,14 @@ class MusicDownloader:
         Pobiera audio za pomocą yt-dlp (lub SLSKD), taguje i umieszcza w /music.
         Zwraca ostateczną ścieżkę do zapisanego pliku.
         """
+        # Jeśli metadata nie posiada poprawnego albumu lub okładki, wzbogać ją oficjalnymi danymi
+        if not metadata.album or metadata.album in ["Unknown Album", "Playlist", "Downloads"] or not metadata.cover_url:
+            enriched = self._enrich_metadata_from_search(metadata.artist, metadata.title)
+            if enriched:
+                if metadata.youtube_url and not enriched.youtube_url:
+                    enriched.youtube_url = metadata.youtube_url
+                metadata = enriched
+
         ext = "opus" if audio_format == "opus" else ("mp3" if audio_format == "mp3" else "flac")
         target_file = self._build_target_path(metadata, ext)
 

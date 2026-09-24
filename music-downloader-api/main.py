@@ -97,11 +97,6 @@ def search_music(
     Przeszukuje katalog Spotify w poszukiwaniu utworów, albumów lub playlist
     wraz z metadanymi i okładkami w wysokiej rozdzielczości.
     """
-    if not spotify_manager.is_configured:
-        raise HTTPException(
-            status_code=503,
-            detail="Integracja ze Spotify nie jest skonfigurowana. Ustaw SPOTIFY_CLIENT_ID i SPOTIFY_CLIENT_SECRET w pliku .env"
-        )
     try:
         results = spotify_manager.search(query=q, search_type=type, limit=limit)
         return {"query": q, "type": type, "count": len(results), "results": results}
@@ -515,6 +510,50 @@ def web_dashboard():
     .input-compact:focus {
       border-color: var(--accent);
     }
+    .versions-panel {
+      background: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.8rem;
+      margin-top: 0.5rem;
+    }
+    .version-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.8rem;
+      padding: 0.5rem 0.6rem;
+      border-radius: 6px;
+      background: #1e293b;
+      margin-bottom: 0.4rem;
+      border: 1px solid #334155;
+    }
+    .version-item:last-child {
+      margin-bottom: 0;
+    }
+    .version-item img {
+      width: 44px;
+      height: 44px;
+      border-radius: 4px;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+    .btn-search-version {
+      background: #334155;
+      color: #f8fafc;
+      border: 1px solid #475569;
+      padding: 0.45rem 0.8rem;
+      border-radius: 6px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      white-space: nowrap;
+    }
+    .btn-search-version:hover {
+      background: #475569;
+      border-color: #64748b;
+    }
     .nav-links {
       display: flex;
       justify-content: center;
@@ -599,7 +638,7 @@ def web_dashboard():
         </div>
         <div>
           <button class="btn-primary" style="padding: 0.75rem 1.4rem; font-size: 0.95rem;" onclick="downloadSelectedTracks()">
-            ⬇️ Pobierz zaznaczone (<span id="selectedCount">0</span>)
+            ⬇️ Pobierz zaznaczone z oficjalnymi albumami (<span id="selectedCount">0</span>)
           </button>
         </div>
       </div>
@@ -610,7 +649,7 @@ def web_dashboard():
           <button class="btn-secondary" style="padding: 0.45rem 0.85rem; font-size: 0.82rem;" onclick="toggleSelectAll(false)">⬜ Odznacz wszystkie</button>
         </div>
         <div style="color: var(--text-muted); font-size: 0.82rem;">
-          💡 Zaznacz utwory do pobrania. Możesz edytować pola przed pobraniem!
+          💡 Lista utworów. Kliknij „🔍 Wybierz wersję”, aby zobaczyć oficjalne albumy i okładki, lub „⬇️ Pobierz”.
         </div>
       </div>
 
@@ -734,28 +773,31 @@ def web_dashboard():
         const div = document.createElement('div');
         div.className = 'track-row';
         div.id = `track-row-${idx}`;
+        div.style.cssText = "display: flex; flex-direction: column; align-items: stretch; gap: 0.5rem; padding: 0.8rem; background: #1e293b; border-radius: 8px; border: 1px solid var(--border);";
         div.innerHTML = `
-          <input type="checkbox" id="check-${idx}" style="width: 20px; height: 20px; cursor: pointer;" checked onchange="updateSelectedCounter()">
-          <img src="${t.cover_url || 'https://via.placeholder.com/50'}" style="width: 50px; height: 50px; border-radius: 6px; object-fit: cover; flex-shrink: 0;" alt="cover">
-          <div class="track-inputs">
-            <div>
-              <span class="field-lbl">Tytuł:</span>
-              <input type="text" id="title-${idx}" class="input-compact" value="${escapeHtml(t.title)}">
+          <div style="display: flex; align-items: center; gap: 0.7rem; width: 100%; flex-wrap: wrap;">
+            <input type="checkbox" id="check-${idx}" style="width: 20px; height: 20px; cursor: pointer;" checked onchange="updateSelectedCounter()">
+            <span style="color: var(--text-muted); font-size: 0.85rem; font-weight: 700; width: 30px; text-align: right; flex-shrink: 0;">#${idx + 1}</span>
+            <div style="flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; min-width: 240px;">
+              <div>
+                <span class="field-lbl">Tytuł:</span>
+                <input type="text" id="title-${idx}" class="input-compact" value="${escapeHtml(t.title)}">
+              </div>
+              <div>
+                <span class="field-lbl">Wykonawca:</span>
+                <input type="text" id="artist-${idx}" class="input-compact" value="${escapeHtml(t.artist)}">
+              </div>
             </div>
-            <div>
-              <span class="field-lbl">Wykonawca:</span>
-              <input type="text" id="artist-${idx}" class="input-compact" value="${escapeHtml(t.artist)}">
-            </div>
-            <div>
-              <span class="field-lbl">Album:</span>
-              <input type="text" id="album-${idx}" class="input-compact" value="${escapeHtml(t.album)}">
-            </div>
-            <div>
-              <span class="field-lbl">Rok:</span>
-              <input type="text" id="year-${idx}" class="input-compact" value="${escapeHtml(t.year || '2026')}">
+            <div style="display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0;">
+              <button class="btn-search-version" id="search-btn-${idx}" onclick="lookupTrackVersions(${idx})" title="Wyszukaj ten utwór w katalogu, zobacz oficjalne albumy i wybierz wersję">
+                🔍 Wybierz wersję
+              </button>
+              <button class="download-small-btn" id="dl-btn-${idx}" onclick="downloadSingleTrackFromList(${idx})" title="Pobierz ten utwór z oficjalnymi metadanymi">
+                ⬇️ Pobierz
+              </button>
             </div>
           </div>
-          <button class="download-small-btn" onclick="downloadSingleCustomTrack(${idx})" title="Pobierz tylko ten utwór">⬇️ Pobierz</button>
+          <div id="versions-${idx}" class="versions-panel" style="display: none;"></div>
         `;
         container.appendChild(div);
       });
@@ -780,26 +822,67 @@ def web_dashboard():
       updateSelectedCounter();
     }
 
-    function getTrackMetadataFromRow(idx) {
+    async function lookupTrackVersions(idx) {
+      const panel = document.getElementById(`versions-${idx}`);
+      if (panel.style.display === 'block') {
+        panel.style.display = 'none';
+        return;
+      }
+
+      const title = document.getElementById(`title-${idx}`).value.trim();
+      const artist = document.getElementById(`artist-${idx}`).value.trim();
+      const query = `${artist} ${title}`.trim() || title;
+
+      panel.style.display = 'block';
+      panel.innerHTML = `<div style="padding: 0.6rem; color: var(--text-muted); font-size: 0.85rem;">⏳ Wyszukiwanie oficjalnych wydań na Spotify / w katalogu...</div>`;
+
+      try {
+        const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(query)}&type=track&limit=5`);
+        const data = await res.json();
+        if (!res.ok || !data.results || data.results.length === 0) {
+          panel.innerHTML = `<div style="padding: 0.6rem; color: #f59e0b; font-size: 0.85rem;">⚠️ Nie znaleziono bezpośrednich wydań w katalogu. Możesz pobrać utwór przyciskiem „⬇️ Pobierz” (downloader automatycznie dobierze studyjne audio).</div>`;
+          return;
+        }
+
+        panel.innerHTML = `
+          <div style="font-size: 0.78rem; font-weight: 700; color: var(--accent); margin-bottom: 0.5rem; text-transform: uppercase;">
+            💿 Oficjalne albumy i wydania (wybierz wersję):
+          </div>
+          <div>
+            ${data.results.map(item => `
+              <div class="version-item">
+                <div style="display: flex; align-items: center; gap: 0.7rem; min-width: 0;">
+                  <img src="${item.cover_url || 'https://via.placeholder.com/44'}" alt="cover">
+                  <div style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    <div style="font-weight: 600; font-size: 0.88rem; color: #fff;">${escapeHtml(item.title)}</div>
+                    <div style="font-size: 0.78rem; color: var(--text-muted);">
+                      ${escapeHtml(item.artist)} • <b style="color: #cbd5e1;">${escapeHtml(item.album)}</b> (${escapeHtml(item.year || '')})
+                    </div>
+                  </div>
+                </div>
+                <button class="download-small-btn" onclick="startDownload('${item.spotify_url || (item.artist + ' - ' + item.title)}')">
+                  ⬇️ Pobierz tę wersję
+                </button>
+              </div>
+            `).join('')}
+          </div>
+        `;
+      } catch (err) {
+        panel.innerHTML = `<div style="padding: 0.6rem; color: #ef4444; font-size: 0.85rem;">Błąd wyszukiwania: ${err}</div>`;
+      }
+    }
+
+    function downloadSingleTrackFromList(idx) {
+      const title = document.getElementById(`title-${idx}`).value.trim();
+      const artist = document.getElementById(`artist-${idx}`).value.trim();
       const original = currentInspectedTracks[idx];
-      return {
-        spotify_id: original.spotify_id || `item_${idx}`,
-        title: document.getElementById(`title-${idx}`).value.trim() || original.title,
-        artists: [document.getElementById(`artist-${idx}`).value.trim() || original.artist],
-        artist: document.getElementById(`artist-${idx}`).value.trim() || original.artist,
-        album: document.getElementById(`album-${idx}`).value.trim() || original.album,
-        album_artist: document.getElementById(`artist-${idx}`).value.trim() || original.artist,
-        track_number: original.track_number || (idx + 1),
-        total_tracks: currentInspectedTracks.length,
-        disc_number: 1,
-        release_date: document.getElementById(`year-${idx}`).value.trim() || "2026",
-        year: document.getElementById(`year-${idx}`).value.trim() || "2026",
-        duration_ms: original.duration_ms || 0,
-        cover_url: original.cover_url,
-        isrc: original.isrc || null,
-        spotify_url: original.spotify_url || "",
-        youtube_url: original.youtube_url || null
-      };
+      const query = (artist && title) ? `${artist} - ${title}` : (original.spotify_url || title);
+      const btn = document.getElementById(`dl-btn-${idx}`);
+      if (btn) {
+        btn.innerText = "⏳...";
+        btn.disabled = true;
+      }
+      startDownload(query);
     }
 
     async function downloadSelectedTracks() {
@@ -807,7 +890,27 @@ def web_dashboard():
       currentInspectedTracks.forEach((_, idx) => {
         const cb = document.getElementById(`check-${idx}`);
         if (cb && cb.checked) {
-          selectedTracks.push(getTrackMetadataFromRow(idx));
+          const title = document.getElementById(`title-${idx}`).value.trim();
+          const artist = document.getElementById(`artist-${idx}`).value.trim();
+          const original = currentInspectedTracks[idx];
+          selectedTracks.push({
+            spotify_id: original.spotify_id || `item_${idx}`,
+            title: title || original.title,
+            artists: [artist || original.artist],
+            artist: artist || original.artist,
+            album: "", // Pozostaw puste, aby backend dopasował oficjalny album ze Spotify
+            album_artist: artist || original.artist,
+            track_number: idx + 1,
+            total_tracks: currentInspectedTracks.length,
+            disc_number: 1,
+            release_date: "",
+            year: "",
+            duration_ms: original.duration_ms || 0,
+            cover_url: null, // Pozostaw null, aby backend pobrał oficjalną okładkę albumu
+            isrc: original.isrc || null,
+            spotify_url: original.spotify_url || "",
+            youtube_url: original.youtube_url || null
+          });
         }
       });
 
@@ -821,7 +924,7 @@ def web_dashboard():
       const statusBox = document.getElementById('statusBox');
 
       statusBox.style.display = "block";
-      statusBox.innerHTML = `⏳ Kolejkowanie ${selectedTracks.length} wybranych utworów...`;
+      statusBox.innerHTML = `⏳ Kolejkowanie ${selectedTracks.length} wybranych utworów z oficjalnymi metadanymi...`;
       statusBox.scrollIntoView({ behavior: 'smooth' });
 
       try {
@@ -837,39 +940,7 @@ def web_dashboard():
         });
         const data = await res.json();
         if (res.ok) {
-          statusBox.innerHTML = `🚀 <b>Zadanie zlecone!</b> Pobieranie ${selectedTracks.length} wybranych utworów...`;
-          pollTask(data.task_id);
-        } else {
-          statusBox.innerHTML = `❌ Błąd: ${data.detail || data.message}`;
-        }
-      } catch (err) {
-        statusBox.innerHTML = `❌ Błąd połączenia: ${err}`;
-      }
-    }
-
-    async function downloadSingleCustomTrack(idx) {
-      const track = getTrackMetadataFromRow(idx);
-      const format = document.getElementById('formatSelect').value;
-      const force = document.getElementById('forceCheck').checked;
-      const statusBox = document.getElementById('statusBox');
-
-      statusBox.style.display = "block";
-      statusBox.innerHTML = `⏳ Kolejkowanie utworu: <b>${track.artist} - ${track.title}</b>...`;
-      statusBox.scrollIntoView({ behavior: 'smooth' });
-
-      try {
-        const res = await fetch(`${API_BASE}/download-selected`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            tracks: [track],
-            format: format,
-            force: force
-          })
-        });
-        const data = await res.json();
-        if (res.ok) {
-          statusBox.innerHTML = `🚀 <b>Zadanie zlecone!</b> Trwa pobieranie...`;
+          statusBox.innerHTML = `🚀 <b>Zadanie zlecone!</b> Pobieranie ${selectedTracks.length} utworów z oficjalnymi albumami i okładkami...`;
           pollTask(data.task_id);
         } else {
           statusBox.innerHTML = `❌ Błąd: ${data.detail || data.message}`;

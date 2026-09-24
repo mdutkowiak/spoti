@@ -159,10 +159,22 @@ class SpotifyManager:
 
         entity = self._extract_entity_from_embed("track", track_id)
         title = entity.get("name") or entity.get("title") or "Unknown Title"
-        artist = entity.get("subtitle") or "Unknown Artist"
-        artists_list = [a.strip() for a in artist.split(",") if a.strip()] or [artist]
-        sources = entity.get("coverArt", {}).get("sources", [])
-        cover_url = sources[0].get("url") if sources else None
+
+        # Nowy format Spotify Embed: entity.get("artists")
+        embed_artists = entity.get("artists", [])
+        if embed_artists:
+            artists_list = [a.get("name") for a in embed_artists if a.get("name")]
+            artist = ", ".join(artists_list)
+        else:
+            artist = entity.get("subtitle") or "Unknown Artist"
+            artists_list = [a.strip() for a in artist.split(",") if a.strip()] or [artist]
+
+        # Okładka: visualIdentity.image lub coverArt.sources
+        images = entity.get("visualIdentity", {}).get("image", []) or entity.get("coverArt", {}).get("sources", [])
+        cover_url = images[-1].get("url") if images else None
+
+        rel_date = entity.get("releaseDate", {}).get("isoString", "") if isinstance(entity.get("releaseDate"), dict) else ""
+        year = rel_date.split("-")[0] if rel_date else "2026"
         duration = entity.get("duration", 0)
 
         return TrackMetadata(
@@ -175,8 +187,8 @@ class SpotifyManager:
             track_number=1,
             total_tracks=1,
             disc_number=1,
-            release_date="2026",
-            year="2026",
+            release_date=rel_date[:10] if rel_date else "2026",
+            year=year,
             duration_ms=duration,
             cover_url=cover_url,
             isrc=None,
@@ -329,15 +341,15 @@ class SpotifyManager:
                         title=t.get("title", f"Track {idx}"),
                         artists=artists_list,
                         artist=subtitle,
-                        album=pl_name,
+                        album="",
                         album_artist=artists_list[0],
                         track_number=idx,
                         total_tracks=len(track_list),
                         disc_number=1,
-                        release_date="2026",
-                        year="2026",
+                        release_date="",
+                        year="",
                         duration_ms=t.get("duration", 0),
-                        cover_url=pl_cover,
+                        cover_url=None,
                         isrc=None,
                         spotify_url=f"https://open.spotify.com/track/{t_id}" if t_id else ""
                     ))
@@ -351,41 +363,89 @@ class SpotifyManager:
         }
         return pl_info, result_tracks
 
+    def _search_itunes(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """
+        Publiczne, bezkluczowe wyszukiwanie w katalogu muzycznym Apple iTunes.
+        Zwraca oficjalne albumy, wykonawców i okładki 640x640 bez potrzeby posiadania kluczy API.
+        """
+        try:
+            resp = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": query, "entity": "song", "limit": limit},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                results = []
+                for item in data.get("results", []):
+                    rel_date = item.get("releaseDate", "")
+                    year = rel_date.split("-")[0] if rel_date else "2026"
+                    cover = (item.get("artworkUrl100") or "").replace("100x100bb", "640x640bb")
+                    results.append({
+                        "spotify_id": f"itunes_{item.get('trackId')}",
+                        "title": item.get("trackName") or "Unknown Title",
+                        "artists": [item.get("artistName") or "Unknown Artist"],
+                        "artist": item.get("artistName") or "Unknown Artist",
+                        "album": item.get("collectionName") or "Single",
+                        "album_artist": item.get("artistName") or "Unknown Artist",
+                        "track_number": item.get("trackNumber", 1),
+                        "total_tracks": item.get("trackCount", 1),
+                        "disc_number": item.get("discNumber", 1),
+                        "release_date": rel_date[:10] if rel_date else year,
+                        "year": year,
+                        "duration_ms": item.get("trackTimeMillis", 0),
+                        "cover_url": cover or None,
+                        "isrc": None,
+                        "spotify_url": ""
+                    })
+                return results
+        except Exception as e:
+            logger.warning(f"Błąd wyszukiwania iTunes API dla '{query}': {e}")
+        return []
+
     def search(self, query: str, search_type: str = "track", limit: int = 10) -> List[Dict[str, Any]]:
-        if not self.sp:
-            raise RuntimeError("Spotify API nie jest skonfigurowane.")
-        
-        search_res = self.sp.search(q=query, type=search_type, limit=limit)
         results = []
+        if self.sp:
+            try:
+                search_res = self.sp.search(q=query, type=search_type, limit=limit)
+                if search_type == "track":
+                    tracks = search_res.get("tracks", {}).get("items", [])
+                    for t in tracks:
+                        results.append(self._format_track_item(t).model_dump())
+                elif search_type == "album":
+                    albums = search_res.get("albums", {}).get("items", [])
+                    for a in albums:
+                        results.append({
+                            "id": a.get("id"),
+                            "name": a.get("name"),
+                            "artists": [art.get("name") for art in a.get("artists", [])],
+                            "release_date": a.get("release_date"),
+                            "total_tracks": a.get("total_tracks"),
+                            "cover_url": a.get("images", [{}])[0].get("url") if a.get("images") else None,
+                            "spotify_url": a.get("external_urls", {}).get("spotify")
+                        })
+                elif search_type == "playlist":
+                    playlists = search_res.get("playlists", {}).get("items", [])
+                    for p in playlists:
+                        if p:
+                            results.append({
+                                "id": p.get("id"),
+                                "name": p.get("name"),
+                                "owner": p.get("owner", {}).get("display_name"),
+                                "total_tracks": p.get("tracks", {}).get("total", 0),
+                                "cover_url": p.get("images", [{}])[0].get("url") if p.get("images") else None,
+                                "spotify_url": p.get("external_urls", {}).get("spotify")
+                            })
+                if results:
+                    return results
+            except Exception as e:
+                logger.warning(f"Błąd Spotify API search ({e}), fallback do katalogu iTunes...")
 
         if search_type == "track":
-            tracks = search_res.get("tracks", {}).get("items", [])
-            for t in tracks:
-                results.append(self._format_track_item(t).model_dump())
-        elif search_type == "album":
-            albums = search_res.get("albums", {}).get("items", [])
-            for a in albums:
-                results.append({
-                    "id": a.get("id"),
-                    "name": a.get("name"),
-                    "artists": [art.get("name") for art in a.get("artists", [])],
-                    "release_date": a.get("release_date"),
-                    "total_tracks": a.get("total_tracks"),
-                    "cover_url": a.get("images", [{}])[0].get("url") if a.get("images") else None,
-                    "spotify_url": a.get("external_urls", {}).get("spotify")
-                })
-        elif search_type == "playlist":
-            playlists = search_res.get("playlists", {}).get("items", [])
-            for p in playlists:
-                if p:
-                    results.append({
-                        "id": p.get("id"),
-                        "name": p.get("name"),
-                        "owner": p.get("owner", {}).get("display_name"),
-                        "total_tracks": p.get("tracks", {}).get("total", 0),
-                        "cover_url": p.get("images", [{}])[0].get("url") if p.get("images") else None,
-                        "spotify_url": p.get("external_urls", {}).get("spotify")
-                    })
+            itunes_res = self._search_itunes(query, limit=limit)
+            if itunes_res:
+                return itunes_res
+
         return results
 
 
@@ -454,12 +514,12 @@ def inspect_url(url_or_query: str) -> Dict[str, Any]:
                     title=v_track_title or v_title,
                     artists=[v_artist],
                     artist=v_artist,
-                    album=pl_title,
+                    album="",
                     album_artist=v_artist,
                     track_number=idx,
                     total_tracks=len(raw_entries),
-                    release_date="2026",
-                    year="2026",
+                    release_date="",
+                    year="",
                     duration_ms=int(v_dur * 1000) if v_dur else 0,
                     cover_url=v_thumb,
                     spotify_url="",
