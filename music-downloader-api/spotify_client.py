@@ -12,21 +12,22 @@ logger = logging.getLogger("music-downloader.spotify")
 
 
 class TrackMetadata(BaseModel):
-    spotify_id: str
-    title: str
-    artists: List[str]
-    artist: str
-    album: str
-    album_artist: str
-    track_number: int
-    total_tracks: int
+    spotify_id: str = ""
+    title: str = "Unknown Title"
+    artists: List[str] = []
+    artist: str = "Unknown Artist"
+    album: str = "Unknown Album"
+    album_artist: str = "Unknown Artist"
+    track_number: int = 1
+    total_tracks: int = 1
     disc_number: int = 1
-    release_date: str
-    year: str
-    duration_ms: int
+    release_date: str = "2026"
+    year: str = "2026"
+    duration_ms: int = 0
     cover_url: Optional[str] = None
     isrc: Optional[str] = None
-    spotify_url: str
+    spotify_url: str = ""
+    youtube_url: Optional[str] = None
 
 
 class SpotifyManager:
@@ -389,3 +390,187 @@ class SpotifyManager:
 
 
 spotify_manager = SpotifyManager()
+
+
+def inspect_url(url_or_query: str) -> Dict[str, Any]:
+    """
+    Bada link ze Spotify (playlista, album, utwór) lub YouTube (playlista, film)
+    albo zapytanie tekstowe i zwraca listę utworów z metadanymi do wyboru i edycji przez użytkownika.
+    """
+    import html
+    import yt_dlp
+
+    url = url_or_query.strip()
+
+    # 1. Sprawdź, czy to link YouTube (wideo lub playlista)
+    is_yt = bool(re.search(r"(youtube\.com|youtu\.be)", url, re.I))
+    if is_yt:
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            raise ValueError(f"Nie udało się odczytać danych z linku YouTube: {url}")
+
+        if "entries" in info:
+            # Playlista YouTube
+            pl_title = info.get("title") or "Playlista YouTube"
+            pl_author = info.get("uploader") or info.get("channel") or "YouTube"
+            raw_entries = list(info.get("entries") or [])
+            tracks: List[TrackMetadata] = []
+
+            for idx, entry in enumerate(raw_entries, 1):
+                if not entry:
+                    continue
+                v_title = html.unescape(entry.get("title") or f"Track {idx}")
+                clean_title = re.sub(
+                    r"[\(\[](Official\s*(Music\s*)?Video|MV|Official\s*Audio|Visualizer|Lyric\s*Video)[\)\]]",
+                    "",
+                    v_title,
+                    flags=re.I
+                ).strip()
+
+                if " - " in clean_title:
+                    parts = clean_title.split(" - ", 1)
+                    v_artist = parts[0].strip()
+                    v_track_title = parts[1].strip()
+                else:
+                    v_artist = entry.get("uploader") or entry.get("channel") or pl_author
+                    v_track_title = clean_title
+
+                thumbs = entry.get("thumbnails") or []
+                v_thumb = thumbs[-1].get("url") if thumbs else entry.get("thumbnail")
+                v_id = entry.get("id") or entry.get("url")
+                v_dur = entry.get("duration") or 0
+                yt_watch_url = f"https://www.youtube.com/watch?v={v_id}" if v_id and not str(v_id).startswith("http") else str(v_id)
+
+                tracks.append(TrackMetadata(
+                    spotify_id=f"yt_{v_id}",
+                    title=v_track_title or v_title,
+                    artists=[v_artist],
+                    artist=v_artist,
+                    album=pl_title,
+                    album_artist=v_artist,
+                    track_number=idx,
+                    total_tracks=len(raw_entries),
+                    release_date="2026",
+                    year="2026",
+                    duration_ms=int(v_dur * 1000) if v_dur else 0,
+                    cover_url=v_thumb,
+                    spotify_url="",
+                    youtube_url=yt_watch_url
+                ))
+
+            return {
+                "type": "playlist",
+                "source": "youtube",
+                "title": pl_title,
+                "owner": pl_author,
+                "total_tracks": len(tracks),
+                "cover_url": tracks[0].cover_url if tracks else None,
+                "tracks": [t.model_dump() for t in tracks]
+            }
+        else:
+            # Pojedynczy film YouTube
+            v_title = html.unescape(info.get("title") or "YouTube Track")
+            clean_title = re.sub(
+                r"[\(\[](Official\s*(Music\s*)?Video|MV|Official\s*Audio|Visualizer|Lyric\s*Video)[\)\]]",
+                "",
+                v_title,
+                flags=re.I
+            ).strip()
+
+            if " - " in clean_title:
+                parts = clean_title.split(" - ", 1)
+                v_artist = parts[0].strip()
+                v_track_title = parts[1].strip()
+            else:
+                v_artist = info.get("uploader") or info.get("channel") or "Unknown Artist"
+                v_track_title = clean_title
+
+            thumbs = info.get("thumbnails") or []
+            v_thumb = thumbs[-1].get("url") if thumbs else info.get("thumbnail")
+            v_dur = info.get("duration") or 0
+            v_id = info.get("id")
+
+            meta = TrackMetadata(
+                spotify_id=f"yt_{v_id}",
+                title=v_track_title or v_title,
+                artists=[v_artist],
+                artist=v_artist,
+                album=v_track_title or v_title,
+                album_artist=v_artist,
+                track_number=1,
+                total_tracks=1,
+                release_date="2026",
+                year="2026",
+                duration_ms=int(v_dur * 1000) if v_dur else 0,
+                cover_url=v_thumb,
+                spotify_url="",
+                youtube_url=url
+            )
+            return {
+                "type": "track",
+                "source": "youtube",
+                "title": meta.title,
+                "owner": v_artist,
+                "total_tracks": 1,
+                "cover_url": v_thumb,
+                "tracks": [meta.model_dump()]
+            }
+
+    # 2. Sprawdź, czy to link Spotify
+    res_type, res_id = spotify_manager.parse_spotify_link(url)
+    if res_type == "track" and res_id:
+        meta = spotify_manager.get_track_metadata(res_id)
+        return {
+            "type": "track",
+            "source": "spotify",
+            "title": meta.title,
+            "owner": meta.artist,
+            "total_tracks": 1,
+            "cover_url": meta.cover_url,
+            "tracks": [meta.model_dump()]
+        }
+    elif res_type == "album" and res_id:
+        alb_info, tracks = spotify_manager.get_album_tracks(res_id)
+        return {
+            "type": "album",
+            "source": "spotify",
+            "title": alb_info.get("name", "Album"),
+            "owner": ", ".join(alb_info.get("artists", [])) or "Artist",
+            "total_tracks": len(tracks),
+            "cover_url": alb_info.get("cover_url"),
+            "tracks": [t.model_dump() for t in tracks]
+        }
+    elif res_type == "playlist" and res_id:
+        pl_info, tracks = spotify_manager.get_playlist_tracks(res_id)
+        return {
+            "type": "playlist",
+            "source": "spotify",
+            "title": pl_info.get("name", "Playlist"),
+            "owner": pl_info.get("owner", "Spotify"),
+            "total_tracks": len(tracks),
+            "cover_url": pl_info.get("cover_url"),
+            "tracks": [t.model_dump() for t in tracks]
+        }
+
+    # 3. Zwykłe zapytanie tekstowe
+    if spotify_manager.is_configured:
+        results = spotify_manager.search(url, search_type="track", limit=10)
+        return {
+            "type": "search",
+            "source": "spotify",
+            "title": f"Wyniki wyszukiwania dla: {url}",
+            "owner": "Spotify",
+            "total_tracks": len(results),
+            "cover_url": results[0].get("cover_url") if results else None,
+            "tracks": results
+        }
+
+    raise ValueError(f"Nie rozpoznano linku ani nie można wyszukać: {url}")

@@ -211,7 +211,8 @@ class MusicDownloader:
         self,
         metadata: TrackMetadata,
         audio_format: str = "opus",
-        force: bool = False
+        force: bool = False,
+        direct_source: Optional[str] = None
     ) -> str:
         """
         Pobiera audio za pomocą yt-dlp (lub SLSKD), taguje i umieszcza w /music.
@@ -230,8 +231,8 @@ class MusicDownloader:
             if self._download_via_slskd(metadata, target_file):
                 logger.info("Zadanie FLAC przekazane do SLSKD.")
 
-        # Inteligentny wybór źródła (preferuje czyste audio z Topic / bez skitów)
-        youtube_source = self._find_best_youtube_match(metadata)
+        # Inteligentny wybór źródła: bezpośredni link YouTube lub Topic Matcher
+        youtube_source = direct_source or metadata.youtube_url or self._find_best_youtube_match(metadata)
         temp_id = f"dl_{metadata.spotify_id or abs(hash(metadata.artist + metadata.title))}"
         temp_out_tmpl = os.path.join(self.temp_dir, f"{temp_id}.%(ext)s")
         temp_expected_file = os.path.join(self.temp_dir, f"{temp_id}.{ext}")
@@ -378,6 +379,75 @@ class MusicDownloader:
 
         except Exception as e:
             logger.exception(f"Błąd podczas realizacji zadania {task_id}: {e}")
+            task_manager.update_task(task_id, status=TaskStatus.FAILED, error_message=str(e))
+
+    def process_custom_tracks_in_background(
+        self,
+        task_id: str,
+        tracks: List[TrackMetadata],
+        audio_format: str = "opus",
+        force: bool = False,
+        playlist_name: Optional[str] = None
+    ):
+        """
+        Pobiera wyselekcjonowane przez użytkownika utwory z ew. edytowanymi metadanymi.
+        """
+        task = task_manager.get_task(task_id)
+        if not task:
+            return
+
+        task_manager.update_task(task_id, status=TaskStatus.PROCESSING, total_tracks=len(tracks))
+        created_files = []
+
+        try:
+            for idx, track_meta in enumerate(tracks, 1):
+                task_manager.update_task(
+                    task_id,
+                    current_track=f"({idx}/{len(tracks)}) {track_meta.artist} - {track_meta.title}"
+                )
+                try:
+                    saved_file = self.download_track(
+                        track_meta,
+                        audio_format=audio_format,
+                        force=force,
+                        direct_source=track_meta.youtube_url
+                    )
+                    created_files.append(saved_file)
+                    task_manager.update_task(task_id, completed_tracks=len(created_files), added_file=saved_file)
+                except Exception as te:
+                    logger.error(f"Błąd pobierania wybranego utworu {track_meta.artist} - {track_meta.title}: {te}")
+
+            if playlist_name and created_files:
+                pl_dir = os.path.join(self.music_dir, "Playlists")
+                os.makedirs(pl_dir, exist_ok=True)
+                pl_path = os.path.join(pl_dir, f"{sanitize_filename(playlist_name)}.m3u8")
+                try:
+                    with open(pl_path, "w", encoding="utf-8") as f:
+                        f.write("#EXTM3U\n")
+                        for cf in created_files:
+                            rel_path = os.path.relpath(cf, pl_dir).replace("\\", "/")
+                            f.write(f"{rel_path}\n")
+                    logger.info(f"Utworzono plik playlisty M3U8: {pl_path}")
+                except Exception as pe:
+                    logger.warning(f"Nie udało się utworzyć pliku playlisty: {pe}")
+
+            # Odświeżenie Navidrome
+            logger.info("Odświeżanie biblioteki Navidrome...")
+            navidrome_client.trigger_scan()
+
+            if len(tracks) == 1:
+                t = tracks[0]
+                telegram_notifier.send_message(f"🎵 *Pobrano wybrany utwór:*\n*{t.artist}* – {t.title}\nFormat: `{audio_format}`")
+            else:
+                telegram_notifier.send_message(f"💿 *Pobrano {len(created_files)}/{len(tracks)} wybranych utworów:*\nFormat: `{audio_format}`")
+
+            if not created_files:
+                raise RuntimeError("Nie udało się pobrać żadnego z wybranych utworów.")
+
+            task_manager.update_task(task_id, status=TaskStatus.SUCCESS)
+
+        except Exception as e:
+            logger.exception(f"Błąd podczas realizacji zadania custom tracks {task_id}: {e}")
             task_manager.update_task(task_id, status=TaskStatus.FAILED, error_message=str(e))
 
 
