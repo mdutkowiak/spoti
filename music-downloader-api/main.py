@@ -554,6 +554,28 @@ def web_dashboard():
       background: #475569;
       border-color: #64748b;
     }
+    .toast {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #1e293b;
+      border: 1px solid var(--accent);
+      color: #fff;
+      padding: 0.8rem 1.2rem;
+      border-radius: 8px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      z-index: 9999;
+      font-size: 0.9rem;
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      animation: toastSlideIn 0.3s ease-out;
+      max-width: 420px;
+    }
+    @keyframes toastSlideIn {
+      from { transform: translateY(30px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
     .nav-links {
       display: flex;
       justify-content: center;
@@ -616,7 +638,7 @@ def web_dashboard():
 
       <div class="btn-row" style="flex-wrap: wrap;">
         <button class="btn-primary" onclick="inspectPlaylistOrLink()">📋 Wybierz utwory z playlisty / linku (Ręczny)</button>
-        <button class="btn-secondary" onclick="startDownload()">⚡ Szybkie pobranie w tle (Automat)</button>
+        <button class="btn-secondary" onclick="startDownload(null, true)">⚡ Szybkie pobranie w tle (Automat)</button>
       </div>
 
       <div id="statusBox" class="status-box"></div>
@@ -849,7 +871,10 @@ def web_dashboard():
             💿 Oficjalne albumy i wydania (wybierz wersję):
           </div>
           <div>
-            ${data.results.map(item => `
+            ${data.results.map(item => {
+              const q = item.spotify_url || (item.artist + ' - ' + item.title);
+              const encQ = encodeURIComponent(q);
+              return `
               <div class="version-item">
                 <div style="display: flex; align-items: center; gap: 0.7rem; min-width: 0;">
                   <img src="${item.cover_url || 'https://via.placeholder.com/44'}" alt="cover">
@@ -860,11 +885,12 @@ def web_dashboard():
                     </div>
                   </div>
                 </div>
-                <button class="download-small-btn" onclick="startDownload('${item.spotify_url || (item.artist + ' - ' + item.title)}')">
+                <button class="download-small-btn" onclick="downloadVersionFromList(${idx}, decodeURIComponent('${encQ}'))" style="flex-shrink: 0;">
                   ⬇️ Pobierz tę wersję
                 </button>
               </div>
-            `).join('')}
+            `;
+            }).join('')}
           </div>
         `;
       } catch (err) {
@@ -872,24 +898,58 @@ def web_dashboard():
       }
     }
 
+    function showToast(message) {
+      let toast = document.getElementById('floatingToast');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'floatingToast';
+        toast.className = 'toast';
+        document.body.appendChild(toast);
+      }
+      toast.innerHTML = message;
+      toast.style.display = 'flex';
+      clearTimeout(window._toastTimeout);
+      window._toastTimeout = setTimeout(() => {
+        toast.style.display = 'none';
+      }, 4000);
+    }
+
+    function removeTrackRowWithAnimation(idx) {
+      const row = document.getElementById(`track-row-${idx}`);
+      if (row) {
+        row.style.transition = "all 0.35s ease";
+        row.style.opacity = "0";
+        row.style.transform = "translateX(50px)";
+        setTimeout(() => {
+          row.style.display = "none";
+          const cb = document.getElementById(`check-${idx}`);
+          if (cb) cb.checked = false;
+          updateSelectedCounter();
+        }, 350);
+      }
+    }
+
+    function downloadVersionFromList(idx, query) {
+      removeTrackRowWithAnimation(idx);
+      startDownload(query, false);
+    }
+
     function downloadSingleTrackFromList(idx) {
       const title = document.getElementById(`title-${idx}`).value.trim();
       const artist = document.getElementById(`artist-${idx}`).value.trim();
       const original = currentInspectedTracks[idx];
       const query = (artist && title) ? `${artist} - ${title}` : (original.spotify_url || title);
-      const btn = document.getElementById(`dl-btn-${idx}`);
-      if (btn) {
-        btn.innerText = "⏳...";
-        btn.disabled = true;
-      }
-      startDownload(query);
+      removeTrackRowWithAnimation(idx);
+      startDownload(query, false);
     }
 
     async function downloadSelectedTracks() {
       const selectedTracks = [];
+      const selectedIndices = [];
       currentInspectedTracks.forEach((_, idx) => {
         const cb = document.getElementById(`check-${idx}`);
         if (cb && cb.checked) {
+          selectedIndices.push(idx);
           const title = document.getElementById(`title-${idx}`).value.trim();
           const artist = document.getElementById(`artist-${idx}`).value.trim();
           const original = currentInspectedTracks[idx];
@@ -925,7 +985,10 @@ def web_dashboard():
 
       statusBox.style.display = "block";
       statusBox.innerHTML = `⏳ Kolejkowanie ${selectedTracks.length} wybranych utworów z oficjalnymi metadanymi...`;
-      statusBox.scrollIntoView({ behavior: 'smooth' });
+      showToast(`⏳ Kolejkowanie ${selectedTracks.length} wybranych utworów...`);
+
+      // Ukryj pobierane kafelki z animacją
+      selectedIndices.forEach(idx => removeTrackRowWithAnimation(idx));
 
       try {
         const res = await fetch(`${API_BASE}/download-selected`, {
@@ -941,17 +1004,20 @@ def web_dashboard():
         const data = await res.json();
         if (res.ok) {
           statusBox.innerHTML = `🚀 <b>Zadanie zlecone!</b> Pobieranie ${selectedTracks.length} utworów z oficjalnymi albumami i okładkami...`;
+          showToast(`🚀 <b>Pobieranie ${selectedTracks.length} utworów w toku!</b>`);
           pollTask(data.task_id);
         } else {
           statusBox.innerHTML = `❌ Błąd: ${data.detail || data.message}`;
+          showToast(`❌ Błąd: ${data.detail || data.message}`);
         }
       } catch (err) {
         statusBox.innerHTML = `❌ Błąd połączenia: ${err}`;
+        showToast(`❌ Błąd połączenia: ${err}`);
       }
     }
 
     // --- AUTOMATYCZNE POBRANIE W TLE ---
-    async function startDownload(customQuery = null) {
+    async function startDownload(customQuery = null, shouldScroll = false) {
       const q = customQuery || document.getElementById('queryInput').value.trim();
       const format = document.getElementById('formatSelect').value;
       const force = document.getElementById('forceCheck').checked;
@@ -964,7 +1030,10 @@ def web_dashboard():
 
       statusBox.style.display = "block";
       statusBox.innerHTML = "⏳ Kolejkowanie zadania w tle...";
-      statusBox.scrollIntoView({ behavior: 'smooth' });
+      if (shouldScroll) {
+        statusBox.scrollIntoView({ behavior: 'smooth' });
+      }
+      showToast(`⏳ Kolejkowanie: <b>${escapeHtml(q)}</b>...`);
 
       try {
         const res = await fetch(`${API_BASE}/download`, {
@@ -975,12 +1044,15 @@ def web_dashboard():
         const data = await res.json();
         if (res.ok) {
           statusBox.innerHTML = `🚀 <b>Zadanie zlecone!</b> Trwa pobieranie...`;
+          showToast(`🚀 <b>Zadanie zlecone:</b> ${escapeHtml(q)}`);
           pollTask(data.task_id);
         } else {
           statusBox.innerHTML = `❌ Błąd: ${data.detail || data.message}`;
+          showToast(`❌ Błąd: ${data.detail || data.message}`);
         }
       } catch (err) {
         statusBox.innerHTML = `❌ Błąd połączenia: ${err}`;
+        showToast(`❌ Błąd połączenia: ${err}`);
       }
     }
 
@@ -995,9 +1067,11 @@ def web_dashboard():
           } else if (task.status === 'success') {
             clearInterval(interval);
             statusBox.innerHTML = `✅ <b>Gotowe!</b> Pobrano ${task.completed_tracks} utworów. Biblioteka Navidrome została natychmiast zaktualizowana!`;
+            showToast(`✅ <b>Gotowe!</b> Pobrano ${task.completed_tracks} utworów.`);
           } else if (task.status === 'failed') {
             clearInterval(interval);
             statusBox.innerHTML = `❌ <b>Błąd zadania:</b> ${task.error_message || 'Nieznany błąd'}`;
+            showToast(`❌ Błąd pobierania: ${task.error_message || ''}`);
           }
         } catch (e) {
           clearInterval(interval);
