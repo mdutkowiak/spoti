@@ -143,7 +143,7 @@ class MusicDownloader:
                 logger.info("Zadanie FLAC przekazane do SLSKD.")
 
         # Pobieranie przez yt-dlp ze strumienia YouTube/YouTube Music
-        search_query = f"ytsearch1:{metadata.artist} - {metadata.title} official audio"
+        search_query = f"ytsearch1:{metadata.artist} - {metadata.title}"
         temp_id = f"dl_{metadata.spotify_id or abs(hash(search_query))}"
         temp_out_tmpl = os.path.join(self.temp_dir, f"{temp_id}.%(ext)s")
         temp_expected_file = os.path.join(self.temp_dir, f"{temp_id}.{ext}")
@@ -194,17 +194,17 @@ class MusicDownloader:
             tracks_to_download: List[TrackMetadata] = []
 
             playlist_name = None
-            if res_type == "track" and res_id and spotify_manager.is_configured:
+            if res_type == "track" and res_id:
                 meta = spotify_manager.get_track_metadata(res_id)
                 tracks_to_download.append(meta)
                 task_manager.update_task(task_id, total_tracks=1)
 
-            elif res_type == "album" and res_id and spotify_manager.is_configured:
+            elif res_type == "album" and res_id:
                 alb_info, album_tracks = spotify_manager.get_album_tracks(res_id)
                 tracks_to_download.extend(album_tracks)
                 task_manager.update_task(task_id, total_tracks=len(album_tracks))
 
-            elif res_type == "playlist" and res_id and spotify_manager.is_configured:
+            elif res_type == "playlist" and res_id:
                 pl_info, pl_tracks = spotify_manager.get_playlist_tracks(res_id)
                 playlist_name = pl_info.get("name")
                 tracks_to_download.extend(pl_tracks)
@@ -238,14 +238,24 @@ class MusicDownloader:
                     tracks_to_download.append(meta)
                     task_manager.update_task(task_id, total_tracks=1)
 
+            if not tracks_to_download:
+                raise RuntimeError(f"Nie znaleziono żadnych utworów do pobrania dla: {query_or_url}")
+
+            task_manager.update_task(task_id, total_tracks=len(tracks_to_download))
+
+            failed_tracks = []
             for idx, track_meta in enumerate(tracks_to_download, 1):
                 task_manager.update_task(
                     task_id,
-                    current_track=f"{track_meta.artist} - {track_meta.title}"
+                    current_track=f"({idx}/{len(tracks_to_download)}) {track_meta.artist} - {track_meta.title}"
                 )
-                saved_file = self.download_track(track_meta, audio_format=audio_format, force=force)
-                created_files.append(saved_file)
-                task_manager.update_task(task_id, completed_tracks=idx, added_file=saved_file)
+                try:
+                    saved_file = self.download_track(track_meta, audio_format=audio_format, force=force)
+                    created_files.append(saved_file)
+                    task_manager.update_task(task_id, completed_tracks=len(created_files), added_file=saved_file)
+                except Exception as te:
+                    logger.error(f"Błąd pobierania utworu {track_meta.artist} - {track_meta.title}: {te}")
+                    failed_tracks.append(f"{track_meta.artist} - {track_meta.title}")
 
             # Jeśli to była playlista, utwórz plik .m3u8 w /music/Playlists/
             if res_type == "playlist" and playlist_name and created_files:
@@ -256,7 +266,7 @@ class MusicDownloader:
                     with open(pl_path, "w", encoding="utf-8") as f:
                         f.write("#EXTM3U\n")
                         for cf in created_files:
-                            rel_path = os.path.relpath(cf, pl_dir)
+                            rel_path = os.path.relpath(cf, pl_dir).replace("\\", "/")
                             f.write(f"{rel_path}\n")
                     logger.info(f"Utworzono plik playlisty M3U8: {pl_path}")
                 except Exception as pe:
@@ -271,7 +281,10 @@ class MusicDownloader:
                 t = tracks_to_download[0]
                 telegram_notifier.send_message(f"🎵 *Pobrano utwór do biblioteki:*\n*{t.artist}* – {t.title}\nFormat: `{audio_format}`")
             else:
-                telegram_notifier.send_message(f"💿 *Pobrano zestaw ({len(tracks_to_download)} utworów):*\nFormat: `{audio_format}`")
+                telegram_notifier.send_message(f"💿 *Pobrano zestaw ({len(created_files)}/{len(tracks_to_download)} utworów):*\nFormat: `{audio_format}`")
+
+            if not created_files:
+                raise RuntimeError("Nie udało się pobrać żadnego utworu. Sprawdź logi serwera.")
 
             task_manager.update_task(task_id, status=TaskStatus.SUCCESS)
 
