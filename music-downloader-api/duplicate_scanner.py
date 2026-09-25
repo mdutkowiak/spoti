@@ -11,6 +11,12 @@ logger = logging.getLogger("music-downloader.scanner")
 class DuplicateScanner:
     def __init__(self, music_dir: str):
         self.music_dir = music_dir
+        self._tracks_cache = None
+        self._tracks_cache_time = 0.0
+
+    def invalidate_cache(self):
+        self._tracks_cache = None
+        self._tracks_cache_time = 0.0
 
     @staticmethod
     def _normalize_title(text: str) -> str:
@@ -243,12 +249,75 @@ class DuplicateScanner:
             else:
                 logger.warning(f"Plik do usunięcia nie istnieje: {target_path}")
 
+        if deleted_count > 0:
+            self.invalidate_cache()
+
         return {
             "deleted_count": deleted_count,
             "freed_bytes": freed_bytes,
             "freed_str": self._format_bytes(freed_bytes),
             "errors": errors
         }
+
+    def get_all_tracks(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """
+        Zwraca pełną listę wszystkich utworów w bibliotece wraz ze szczegółowymi statystykami.
+        Wyniki są keszowane na 30 sekund w celu natychmiastowej responsywności UI.
+        """
+        now = time.time()
+        if not force_refresh and self._tracks_cache is not None and (now - self._tracks_cache_time < 30.0):
+            return self._tracks_cache
+
+        if not os.path.exists(self.music_dir):
+            data = {
+                "total_tracks": 0,
+                "total_size_bytes": 0,
+                "total_size_str": "0 B",
+                "total_artists": 0,
+                "total_albums": 0,
+                "tracks": []
+            }
+            self._tracks_cache = data
+            self._tracks_cache_time = now
+            return data
+
+        audio_exts = {".opus", ".mp3", ".flac", ".m4a", ".ogg", ".wav"}
+        tracks: List[Dict[str, Any]] = []
+        total_size = 0
+        artists = set()
+        albums = set()
+
+        try:
+            for root, _, files in os.walk(self.music_dir):
+                for f in files:
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in audio_exts:
+                        full_path = os.path.join(root, f)
+                        rel_path = os.path.relpath(full_path, self.music_dir)
+                        meta = self._read_file_metadata(full_path, rel_path)
+                        tracks.append(meta)
+                        total_size += meta["size_bytes"]
+                        if meta["artist"] and meta["artist"] != "Nieznany wykonawca":
+                            artists.add(meta["artist"].lower().strip())
+                        if meta["album"] and meta["album"] != "Brak albumu":
+                            albums.add(meta["album"].lower().strip())
+        except Exception as e:
+            logger.error(f"Błąd skanowania biblioteki utworów: {e}")
+
+        # Domyślnie posortowane od najnowszych
+        tracks.sort(key=lambda t: t["mtime"], reverse=True)
+
+        data = {
+            "total_tracks": len(tracks),
+            "total_size_bytes": total_size,
+            "total_size_str": self._format_bytes(total_size),
+            "total_artists": len(artists),
+            "total_albums": len(albums),
+            "tracks": tracks
+        }
+        self._tracks_cache = data
+        self._tracks_cache_time = now
+        return data
 
 
 duplicate_scanner = DuplicateScanner(settings.MUSIC_DIR)

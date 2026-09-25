@@ -14,6 +14,7 @@ from navidrome_client import navidrome_client
 from telegram_notifier import telegram_notifier
 from tasks import task_manager, TaskStatus
 from library_checker import library_checker
+from duplicate_scanner import duplicate_scanner
 
 logger = logging.getLogger("music-downloader.engine")
 
@@ -405,6 +406,7 @@ class MusicDownloader:
             # Uruchomienie natychmiastowego reskanu biblioteki w Navidrome
             logger.info("Wyzwalanie automatycznego reskanu Navidrome...")
             navidrome_client.trigger_scan()
+            duplicate_scanner.invalidate_cache()
 
             # Powiadomienie Telegram
             if len(tracks_to_download) == 1:
@@ -475,6 +477,7 @@ class MusicDownloader:
             # Odświeżenie Navidrome
             logger.info("Odświeżanie biblioteki Navidrome...")
             navidrome_client.trigger_scan()
+            duplicate_scanner.invalidate_cache()
 
             if len(tracks) == 1:
                 t = tracks[0]

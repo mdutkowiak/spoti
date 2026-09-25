@@ -4,7 +4,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from pydantic import BaseModel, Field
 
 from config import settings
@@ -39,10 +39,11 @@ app.add_middleware(
 
 
 # Weryfikacja klucza API (opcjonalna)
-def verify_api_key(x_api_key: Optional[str] = Header(None)):
+def verify_api_key(x_api_key: Optional[str] = Header(None), api_key: Optional[str] = Query(None)):
     if not settings.API_SECRET_KEY or settings.API_SECRET_KEY in ["", "change_this_secret_token_for_api_auth"]:
         return True
-    if settings.API_SECRET_KEY != x_api_key:
+    key = x_api_key or api_key
+    if settings.API_SECRET_KEY != key:
         raise HTTPException(status_code=401, detail="Nieprawidłowy lub brakujący klucz X-API-Key.")
     return True
 
@@ -79,6 +80,16 @@ class RefreshResponse(BaseModel):
 
 class DeleteDuplicatesRequest(BaseModel):
     paths: List[str] = Field(..., description="Lista relatywnych ścieżek plików do usunięcia")
+
+
+class DeleteTracksRequest(BaseModel):
+    paths: List[str] = Field(..., description="Lista relatywnych ścieżek plików do usunięcia")
+
+
+class AddTrackToPlaylistRequest(BaseModel):
+    title: str = Field(..., description="Tytuł utworu")
+    artist: Optional[str] = Field(default="", description="Wykonawca utworu")
+    rel_path: Optional[str] = Field(default=None, description="Opcjonalna relatywna ścieżka pliku")
 
 
 class CreatePlaylistRequest(BaseModel):
@@ -238,6 +249,7 @@ def clear_music_library(_: bool = Depends(verify_api_key)):
                 logger.error(f"Błąd usuwania {item_path}: {e}")
 
     library_checker.invalidate()
+    duplicate_scanner.invalidate_cache()
     res = navidrome_client.trigger_scan(full_scan=True)
     return {
         "status": "success",
@@ -304,6 +316,53 @@ async def telegram_webhook(update: dict, background_tasks: BackgroundTasks):
     )
 
     return {"status": "queued", "task_id": task.task_id}
+
+
+# =============================================================================
+# LIBRARY MANAGEMENT ENDPOINTS
+# =============================================================================
+
+@app.get("/library/tracks", tags=["Library"])
+def get_library_tracks(force: bool = False, _: bool = Depends(verify_api_key)):
+    """
+    Zwraca pełną listę wszystkich utworów w bibliotece wraz ze szczegółowymi statystykami.
+    """
+    return duplicate_scanner.get_all_tracks(force_refresh=force)
+
+
+@app.delete("/library/tracks", tags=["Library"])
+def delete_library_tracks(req: DeleteTracksRequest, _: bool = Depends(verify_api_key)):
+    """
+    Bezpiecznie usuwa wybrane pliki z biblioteki i odświeża indeksy w Navidrome.
+    """
+    res = duplicate_scanner.delete_files(req.paths)
+    if res.get("deleted_count", 0) > 0:
+        duplicate_scanner.invalidate_cache()
+        library_checker.invalidate()
+        navidrome_client.trigger_scan(full_scan=False)
+    return res
+
+
+@app.get("/library/stream", tags=["Library"])
+def stream_audio(path: str = Query(...), _: bool = Depends(verify_api_key)):
+    """
+    Udostępnia plik audio do bezpośredniego odsłuchania / streamingu w przeglądarce.
+    """
+    music_dir_abs = os.path.abspath(settings.MUSIC_DIR)
+    target_path = os.path.abspath(os.path.join(music_dir_abs, path.strip().lstrip("/\\")))
+    if not target_path.startswith(music_dir_abs) or not os.path.isfile(target_path):
+        raise HTTPException(status_code=404, detail="Plik nie istnieje na serwerze.")
+
+    ext = os.path.splitext(target_path)[1].lower()
+    media_types = {
+        ".opus": "audio/ogg; codecs=opus",
+        ".ogg": "audio/ogg",
+        ".mp3": "audio/mpeg",
+        ".flac": "audio/flac",
+        ".m4a": "audio/mp4",
+        ".wav": "audio/wav"
+    }
+    return FileResponse(target_path, media_type=media_types.get(ext, "application/octet-stream"))
 
 
 # =============================================================================
@@ -382,6 +441,29 @@ def delete_playlist(playlist_id: str, _: bool = Depends(verify_api_key)):
 @app.get("/library/songs/search", tags=["Playlists"])
 def search_navidrome_songs(q: str = Query(..., min_length=1), _: bool = Depends(verify_api_key)):
     return navidrome_client.search_songs(q)
+
+
+@app.post("/library/playlists/{playlist_id}/add-track", tags=["Playlists"])
+def add_single_track_to_playlist(playlist_id: str, req: AddTrackToPlaylistRequest, _: bool = Depends(verify_api_key)):
+    """
+    Wyszukuje utwór w Navidrome po tytule i wykonawcy, a następnie dodaje go do wybranej playlisty.
+    """
+    query = f"{req.artist} {req.title}".strip() if req.artist else req.title
+    songs = navidrome_client.search_songs(query, count=10)
+    if not songs and req.title:
+        songs = navidrome_client.search_songs(req.title, count=10)
+
+    if not songs:
+        raise HTTPException(
+            status_code=404,
+            detail="Nie znaleziono utworu w indeksie Navidrome. Upewnij się, że biblioteka została przeskanowana w Navidrome."
+        )
+
+    song_id = songs[0].get("id")
+    if not song_id:
+        raise HTTPException(status_code=404, detail="Brak identyfikatora utworu w Navidrome.")
+
+    return navidrome_client.add_tracks_to_playlist(playlist_id, [song_id])
 
 
 # =============================================================================
@@ -953,6 +1035,82 @@ def web_dashboard():
       text-transform: uppercase;
       letter-spacing: 0.5px;
     }
+    .audio-player-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(12px);
+      border-top: 1px solid rgba(29, 185, 84, 0.4);
+      padding: 0.75rem 1.5rem;
+      z-index: 9999;
+      box-shadow: 0 -4px 25px rgba(0, 0, 0, 0.6);
+      animation: slideUp 0.25s ease-out;
+    }
+    @keyframes slideUp {
+      from { transform: translateY(100%); }
+      to { transform: translateY(0); }
+    }
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      padding: 1rem;
+    }
+    .modal-box {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+    }
+    .track-lib-item {
+      display: flex;
+      align-items: center;
+      gap: 0.8rem;
+      padding: 0.75rem 1rem;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      transition: all 0.15s ease;
+      flex-wrap: wrap;
+    }
+    .track-lib-item:hover {
+      border-color: #3b82f6;
+      background: #131d35;
+    }
+    .track-lib-item.active-playing {
+      border-color: var(--primary);
+      background: rgba(29, 185, 84, 0.08);
+    }
+    .badge-fmt-opus {
+      background: rgba(16, 185, 129, 0.15);
+      color: #10b981;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+    .badge-fmt-mp3 {
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.3);
+    }
+    .badge-fmt-flac {
+      background: rgba(168, 85, 247, 0.15);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.3);
+    }
+    .badge-fmt-m4a {
+      background: rgba(245, 158, 11, 0.15);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.3);
+    }
   </style>
 </head>
 <body>
@@ -965,7 +1123,8 @@ def web_dashboard():
     <!-- GŁÓWNA NAWIGACJA ZAKŁADKOWA -->
     <div class="tabs-nav">
       <button class="tab-btn active" id="tabBtn-download" onclick="switchTab('download')">📥 Pobieranie i Wyszukiwanie</button>
-      <button class="tab-btn" id="tabBtn-duplicates" onclick="switchTab('duplicates')">🧹 Duplikaty i Biblioteka</button>
+      <button class="tab-btn" id="tabBtn-library" onclick="switchTab('library')">📚 Biblioteka Utworów</button>
+      <button class="tab-btn" id="tabBtn-duplicates" onclick="switchTab('duplicates')">🧹 Wykrywanie Duplikatów</button>
       <button class="tab-btn" id="tabBtn-playlists" onclick="switchTab('playlists')">📑 Playlisty</button>
       <button class="tab-btn" id="tabBtn-users" onclick="switchTab('users')">👥 Użytkownicy</button>
     </div>
@@ -1067,7 +1226,114 @@ def web_dashboard():
     </div>
     <!-- KONIEC ZAKŁADKI 1: POBIERANIE -->
 
-    <!-- ZAKŁADKA 2: DUPLIKATY I BIBLIOTEKA -->
+    <!-- ZAKŁADKA 2: BIBLIOTEKA UTWORÓW -->
+    <div id="tab-library" class="tab-content">
+      <!-- KARTA STATYSTYK BIBLIOTEKI -->
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.2rem;">
+          <div>
+            <h2 style="font-size: 1.25rem; font-weight: 700; color: #fff;">📚 Twoja Biblioteka Muzyczna</h2>
+            <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 0.2rem;">
+              Przeglądaj wszystkie pobrane utwory, odsłuchuj audio w przeglądarce, zarządzaj plikami i twórz playlisty.
+            </p>
+          </div>
+          <div style="display: flex; gap: 0.6rem; flex-wrap: wrap;">
+            <button class="btn-primary" style="flex: 0 0 auto; width: auto; padding: 0.65rem 1.2rem;" onclick="loadLibraryTracks(true)">
+              🔄 Odśwież listę
+            </button>
+          </div>
+        </div>
+
+        <div id="libraryStatusBox" class="status-box" style="display: none;"></div>
+
+        <!-- Pasek statystyk biblioteki -->
+        <div class="stats-card">
+          <div class="stats-item">
+            <span class="stats-val" id="statLibTracks">0</span>
+            <span class="stats-lbl">Utworów w bibliotece</span>
+          </div>
+          <div class="stats-item">
+            <span class="stats-val" id="statLibSize">0 MB</span>
+            <span class="stats-lbl">Rozmiar na dysku</span>
+          </div>
+          <div class="stats-item">
+            <span class="stats-val" id="statLibArtists">0</span>
+            <span class="stats-lbl">Wykonawców</span>
+          </div>
+          <div class="stats-item">
+            <span class="stats-val" id="statLibAlbums">0</span>
+            <span class="stats-lbl">Albumów</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- KARTA PRZEGLĄDARKI I FILTRÓW -->
+      <div class="card">
+        <div style="display: flex; gap: 0.8rem; margin-bottom: 1rem; flex-wrap: wrap; align-items: center;">
+          <div style="flex: 2; min-width: 200px;">
+            <input type="text" id="librarySearchInput" placeholder="🔍 Szukaj po tytule, wykonawcy, albumie..." oninput="handleLibraryFilterChange()">
+          </div>
+          <div style="flex: 1; min-width: 140px;">
+            <select id="libraryFormatSelect" onchange="handleLibraryFilterChange()">
+              <option value="ALL">Wszystkie formaty</option>
+              <option value="OPUS">Tylko OPUS</option>
+              <option value="MP3">Tylko MP3</option>
+              <option value="FLAC">Tylko FLAC</option>
+              <option value="M4A">Tylko M4A</option>
+            </select>
+          </div>
+          <div style="flex: 1; min-width: 170px;">
+            <select id="librarySortSelect" onchange="handleLibraryFilterChange()">
+              <option value="newest" selected>📅 Najnowsze pobrane</option>
+              <option value="oldest">📅 Najstarsze pobrane</option>
+              <option value="title_asc">🔤 Tytuł (A-Z)</option>
+              <option value="title_desc">🔤 Tytuł (Z-A)</option>
+              <option value="artist_asc">🎤 Wykonawca (A-Z)</option>
+              <option value="size_desc">💾 Rozmiar (największe)</option>
+              <option value="duration_desc">⏱️ Czas trwania (najdłuższe)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Pasek akcji masowych -->
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.8rem; margin-bottom: 1rem; padding: 0.6rem 0.8rem; background: #0f172a; border-radius: 8px; border: 1px solid var(--border);">
+          <div style="display: flex; gap: 0.6rem; align-items: center;">
+            <button class="btn-secondary" style="padding: 0.45rem 0.85rem; font-size: 0.82rem;" onclick="toggleSelectAllLibrary(true)">☑️ Zaznacz wszystkie</button>
+            <button class="btn-secondary" style="padding: 0.45rem 0.85rem; font-size: 0.82rem;" onclick="toggleSelectAllLibrary(false)">⬜ Odznacz</button>
+            <span style="color: var(--text-muted); font-size: 0.82rem; margin-left: 0.5rem;" id="libraryFilterCountInfo">Widoczne: 0 / 0</span>
+          </div>
+          <div>
+            <button id="btnDeleteSelectedLib" class="btn-secondary btn-danger-soft" style="padding: 0.45rem 0.95rem; font-size: 0.82rem; display: none;" onclick="deleteSelectedLibraryTracks()">
+              🗑️ Usuń zaznaczone (<span id="selectedLibCount">0</span>)
+            </button>
+          </div>
+        </div>
+
+        <!-- Lista utworów -->
+        <div id="libraryTracksList" style="display: flex; flex-direction: column; gap: 0.5rem;">
+          <div style="text-align: center; padding: 2rem; color: var(--text-muted);">
+            ⏳ Wczytywanie biblioteki utworów...
+          </div>
+        </div>
+      </div>
+
+      <!-- KARTA ADMINISTRACJI I ZARZĄDZANIA BIBLIOTEKĄ -->
+      <div class="card" style="border-color: #334155;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+          <div>
+            <div style="font-weight: 600; font-size: 0.95rem;">Konserwacja biblioteki muzycznej</div>
+            <div style="color: var(--text-muted); font-size: 0.82rem;">Wymuś reskan w Navidrome lub całkowicie wyczyść bazę danych</div>
+          </div>
+          <div style="display: flex; gap: 0.8rem; flex-wrap: wrap;">
+            <button class="btn-secondary" style="padding: 0.6rem 1.1rem; font-size: 0.88rem;" onclick="refreshNavidrome()">🔄 Odśwież Navidrome</button>
+            <button class="btn-secondary" style="padding: 0.6rem 1.1rem; font-size: 0.88rem; background: #7f1d1d; border-color: #991b1b; color: #fecaca;" onclick="clearLibrary()">🗑️ Wyczyść całą bibliotekę</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <!-- KONIEC ZAKŁADKI 2: BIBLIOTEKA -->
+
+    <!-- ZAKŁADKA 3: WYKRYWANIE DUPLIKATÓW -->
     <div id="tab-duplicates" class="tab-content">
       <div class="card">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.2rem;">
@@ -1794,10 +2060,366 @@ def web_dashboard():
       if (activeBtn) activeBtn.classList.add('active');
       if (activePane) activePane.classList.add('active');
 
-      if (tabName === 'playlists') {
+      if (tabName === 'library') {
+        loadLibraryTracks();
+      } else if (tabName === 'playlists') {
         loadPlaylists();
       } else if (tabName === 'users') {
         loadUsers();
+      }
+    }
+
+    // =========================================================================
+    // MODUŁ ZARZĄDZANIA BIBLIOTEKĄ UTWORÓW
+    // =========================================================================
+    let allLibraryTracks = [];
+    let filteredLibraryTracks = [];
+    let selectedLibraryPaths = new Set();
+    let currentPlayingPath = null;
+    let cachedPlaylistsList = [];
+
+    async function loadLibraryTracks(force = false) {
+      const sb = document.getElementById('libraryStatusBox');
+      const listEl = document.getElementById('libraryTracksList');
+
+      if (force) {
+        sb.style.display = 'block';
+        sb.innerHTML = '⏳ Odświeżanie i skanowanie plików w bibliotece /music...';
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/library/tracks${force ? '?force=true' : ''}`);
+        const data = await res.json();
+        if (!res.ok) {
+          sb.style.display = 'block';
+          sb.innerHTML = `❌ Błąd wczytywania biblioteki: ${data.detail || 'Nieznany błąd'}`;
+          return;
+        }
+
+        sb.style.display = 'none';
+        allLibraryTracks = data.tracks || [];
+
+        // Aktualizacja liczników statystyk
+        document.getElementById('statLibTracks').textContent = data.total_tracks || 0;
+        document.getElementById('statLibSize').textContent = data.total_size_str || '0 B';
+        document.getElementById('statLibArtists').textContent = data.total_artists || 0;
+        document.getElementById('statLibAlbums').textContent = data.total_albums || 0;
+
+        selectedLibraryPaths.clear();
+        updateSelectedLibraryCounter();
+        renderLibraryTracks();
+      } catch (err) {
+        sb.style.display = 'block';
+        sb.innerHTML = `❌ Błąd połączenia: ${err}`;
+      }
+    }
+
+    function handleLibraryFilterChange() {
+      renderLibraryTracks();
+    }
+
+    function renderLibraryTracks() {
+      const listEl = document.getElementById('libraryTracksList');
+      const searchVal = document.getElementById('librarySearchInput').value.trim().toLowerCase();
+      const formatVal = document.getElementById('libraryFormatSelect').value;
+      const sortVal = document.getElementById('librarySortSelect').value;
+
+      filteredLibraryTracks = allLibraryTracks.filter(t => {
+        if (formatVal !== 'ALL' && t.format !== formatVal) return false;
+        if (searchVal) {
+          const matchTitle = (t.title || '').toLowerCase().includes(searchVal);
+          const matchArtist = (t.artist || '').toLowerCase().includes(searchVal);
+          const matchAlbum = (t.album || '').toLowerCase().includes(searchVal);
+          const matchFilename = (t.filename || '').toLowerCase().includes(searchVal);
+          if (!matchTitle && !matchArtist && !matchAlbum && !matchFilename) return false;
+        }
+        return true;
+      });
+
+      // Sortowanie
+      filteredLibraryTracks.sort((a, b) => {
+        if (sortVal === 'newest') return (b.mtime || 0) - (a.mtime || 0);
+        if (sortVal === 'oldest') return (a.mtime || 0) - (b.mtime || 0);
+        if (sortVal === 'title_asc') return (a.title || '').localeCompare(b.title || '');
+        if (sortVal === 'title_desc') return (b.title || '').localeCompare(a.title || '');
+        if (sortVal === 'artist_asc') return (a.artist || '').localeCompare(b.artist || '');
+        if (sortVal === 'size_desc') return (b.size_bytes || 0) - (a.size_bytes || 0);
+        if (sortVal === 'duration_desc') {
+          return parseDurationStr(b.duration_str) - parseDurationStr(a.duration_str);
+        }
+        return 0;
+      });
+
+      document.getElementById('libraryFilterCountInfo').textContent = `Widoczne: ${filteredLibraryTracks.length} / ${allLibraryTracks.length}`;
+
+      if (filteredLibraryTracks.length === 0) {
+        if (allLibraryTracks.length === 0) {
+          listEl.innerHTML = `
+            <div style="text-align: center; padding: 2.5rem 1rem; color: var(--text-muted);">
+              <div style="font-size: 2.5rem; margin-bottom: 0.5rem;">🎵</div>
+              <div style="font-weight: 700; font-size: 1.1rem; color: #fff; margin-bottom: 0.3rem;">Brak utworów w bibliotece</div>
+              <div>Przejdź do zakładki <b>Pobieranie</b>, aby dodać pierwsze utwory lub całe playlisty!</div>
+            </div>
+          `;
+        } else {
+          listEl.innerHTML = `
+            <div style="text-align: center; padding: 2rem; color: var(--text-muted);">
+              🔍 Brak utworów pasujących do filtra „${escapeHtml(searchVal)}”.
+            </div>
+          `;
+        }
+        return;
+      }
+
+      listEl.innerHTML = filteredLibraryTracks.map((t, idx) => {
+        const isChecked = selectedLibraryPaths.has(t.rel_path);
+        const isPlaying = currentPlayingPath === t.rel_path;
+        const fmtClass = t.format === 'OPUS' ? 'badge-fmt-opus' : (t.format === 'MP3' ? 'badge-fmt-mp3' : (t.format === 'FLAC' ? 'badge-fmt-flac' : (t.format === 'M4A' ? 'badge-fmt-m4a' : 'badge-fmt')));
+        const safeTitle = escapeHtml(t.title || t.filename);
+        const safeArtist = escapeHtml(t.artist || 'Nieznany wykonawca');
+        const safeAlbum = escapeHtml(t.album || 'Brak albumu');
+
+        return `
+          <div class="track-lib-item ${isPlaying ? 'active-playing' : ''}" id="lib-track-${idx}">
+            <input type="checkbox" style="width: auto; cursor: pointer; transform: scale(1.15);"
+              ${isChecked ? 'checked' : ''}
+              onchange="toggleLibraryTrackSelectByIndex(${idx}, this.checked)">
+
+            <div style="flex: 1; min-width: 180px;">
+              <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                <span class="${fmtClass}" style="font-size: 0.7rem; font-weight: 700; padding: 2px 6px; border-radius: 4px;">${t.format}</span>
+                <span style="font-weight: 700; font-size: 0.95rem; color: #fff;">${safeTitle}</span>
+              </div>
+              <div style="color: var(--text-muted); font-size: 0.82rem; margin-top: 0.2rem;">
+                🎤 <span style="color: #cbd5e1;">${safeArtist}</span> • 💿 <span>${safeAlbum}</span>
+              </div>
+              <div style="color: #64748b; font-size: 0.74rem; margin-top: 0.15rem; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 500px;" title="${escapeHtml(t.rel_path)}">
+                📁 ${escapeHtml(t.rel_path)}
+              </div>
+            </div>
+
+            <div style="display: flex; align-items: center; gap: 0.8rem; font-size: 0.82rem; color: var(--text-muted); flex-wrap: wrap;">
+              ${t.duration_str ? `<span>⏱️ ${t.duration_str}</span>` : ''}
+              ${t.bitrate_kbps ? `<span>⚡ ${t.bitrate_kbps} kbps</span>` : ''}
+              <span>💾 ${t.size_str}</span>
+            </div>
+
+            <div style="display: flex; gap: 0.4rem; align-items: center; flex: 0 0 auto;">
+              <button class="btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="playLibraryTrackByIndex(${idx})" title="Odsłuchaj w przeglądarce">
+                ${isPlaying ? '⏸️ Pauza' : '▶️ Odsłuchaj'}
+              </button>
+              <button class="btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="openAddToPlaylistModalByIndex(${idx})" title="Dodaj do playlisty Navidrome">
+                ➕ Do playlisty
+              </button>
+              <button class="btn-secondary btn-danger-soft" style="padding: 0.4rem 0.65rem; font-size: 0.8rem;" onclick="deleteSingleLibraryTrackByIndex(${idx})" title="Usuń utwór z dysku i biblioteki">
+                🗑️
+              </button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function parseDurationStr(str) {
+      if (!str) return 0;
+      const parts = str.split(':');
+      if (parts.length === 2) return parseInt(parts[0]) * 60 + parseInt(parts[1]);
+      if (parts.length === 3) return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2]);
+      return 0;
+    }
+
+    function toggleLibraryTrackSelectByIndex(idx, checked) {
+      const track = filteredLibraryTracks[idx];
+      if (!track) return;
+      if (checked) {
+        selectedLibraryPaths.add(track.rel_path);
+      } else {
+        selectedLibraryPaths.delete(track.rel_path);
+      }
+      updateSelectedLibraryCounter();
+    }
+
+    function toggleSelectAllLibrary(check) {
+      filteredLibraryTracks.forEach(t => {
+        if (check) {
+          selectedLibraryPaths.add(t.rel_path);
+        } else {
+          selectedLibraryPaths.delete(t.rel_path);
+        }
+      });
+      updateSelectedLibraryCounter();
+      renderLibraryTracks();
+    }
+
+    function updateSelectedLibraryCounter() {
+      const count = selectedLibraryPaths.size;
+      const btn = document.getElementById('btnDeleteSelectedLib');
+      const counter = document.getElementById('selectedLibCount');
+      if (counter) counter.textContent = count;
+      if (btn) {
+        btn.style.display = count > 0 ? 'inline-block' : 'none';
+      }
+    }
+
+    async function deleteSingleLibraryTrackByIndex(idx) {
+      const track = filteredLibraryTracks[idx];
+      if (!track) return;
+      const title = track.title || track.filename;
+      if (!confirm(`Czy na pewno usunąć utwór "${title}" z dysku i biblioteki?`)) return;
+
+      try {
+        const res = await fetch(`${API_BASE}/library/tracks`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths: [track.rel_path] })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`🗑️ Usunięto utwór <b>${escapeHtml(title)}</b>.`);
+          if (currentPlayingPath === track.rel_path) closeAudioPlayer();
+          loadLibraryTracks();
+        } else {
+          alert(`Błąd usuwania: ${data.detail || 'Nieznany błąd'}`);
+        }
+      } catch (err) {
+        alert(`Błąd połączenia: ${err}`);
+      }
+    }
+
+    async function deleteSelectedLibraryTracks() {
+      const count = selectedLibraryPaths.size;
+      if (count === 0) return;
+      if (!confirm(`Czy na pewno bezpowrotnie usunąć ${count} zaznaczonych utworów z dysku?`)) return;
+
+      const paths = Array.from(selectedLibraryPaths);
+      try {
+        const res = await fetch(`${API_BASE}/library/tracks`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paths: paths })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`🗑️ Pomyślnie usunięto ${data.deleted_count} utworów (zwolniono ${data.freed_str}).`);
+          selectedLibraryPaths.clear();
+          loadLibraryTracks();
+        } else {
+          alert(`Błąd usuwania: ${data.detail || 'Nieznany błąd'}`);
+        }
+      } catch (err) {
+        alert(`Błąd połączenia: ${err}`);
+      }
+    }
+
+    function playLibraryTrackByIndex(idx) {
+      const track = filteredLibraryTracks[idx];
+      if (!track) return;
+
+      const playerBar = document.getElementById('audioPlayerBar');
+      const audio = document.getElementById('globalAudioPlayer');
+      const titleEl = document.getElementById('playerTrackTitle');
+      const artistEl = document.getElementById('playerTrackArtist');
+
+      if (currentPlayingPath === track.rel_path && !audio.paused) {
+        audio.pause();
+        currentPlayingPath = null;
+        renderLibraryTracks();
+        return;
+      }
+
+      currentPlayingPath = track.rel_path;
+      titleEl.textContent = track.title || track.filename;
+      artistEl.textContent = track.artist ? `${track.artist} • ${track.album} (${track.format})` : track.format;
+
+      audio.src = `${API_BASE}/library/stream?path=${encodeURIComponent(track.rel_path)}`;
+      playerBar.style.display = 'block';
+      audio.play().catch(e => console.log('Autoplay prevented:', e));
+
+      renderLibraryTracks();
+    }
+
+    function closeAudioPlayer() {
+      const playerBar = document.getElementById('audioPlayerBar');
+      const audio = document.getElementById('globalAudioPlayer');
+      if (audio) {
+        audio.pause();
+        audio.src = '';
+      }
+      currentPlayingPath = null;
+      if (playerBar) playerBar.style.display = 'none';
+      renderLibraryTracks();
+    }
+
+    let targetModalTrack = null;
+
+    async function openAddToPlaylistModalByIndex(idx) {
+      const track = filteredLibraryTracks[idx];
+      if (!track) return;
+
+      targetModalTrack = track;
+      document.getElementById('modalTrackTitle').textContent = track.title || track.filename;
+      document.getElementById('modalTrackArtist').textContent = track.artist || 'Nieznany wykonawca';
+
+      const select = document.getElementById('modalPlaylistSelect');
+      select.innerHTML = '<option value="" disabled selected>⏳ Pobieranie playlist z Navidrome...</option>';
+      document.getElementById('addToPlaylistModal').style.display = 'flex';
+
+      try {
+        const res = await fetch(`${API_BASE}/library/playlists`);
+        const playlists = await res.json();
+        if (!res.ok || !Array.isArray(playlists) || playlists.length === 0) {
+          select.innerHTML = '<option value="" disabled selected>Brak playlist w Navidrome. Stwórz najpierw playlistę w zakładce Playlisty.</option>';
+          return;
+        }
+
+        cachedPlaylistsList = playlists;
+        select.innerHTML = playlists.map(pl => {
+          return `<option value="${escapeHtml(pl.id)}">${escapeHtml(pl.name)} (${pl.songCount || 0} utworów)</option>`;
+        }).join('');
+      } catch (err) {
+        select.innerHTML = `<option value="" disabled selected>Błąd pobierania playlist: ${err}</option>`;
+      }
+    }
+
+    function closeAddToPlaylistModal() {
+      document.getElementById('addToPlaylistModal').style.display = 'none';
+      targetModalTrack = null;
+    }
+
+    async function submitAddToPlaylist() {
+      const select = document.getElementById('modalPlaylistSelect');
+      const playlistId = select.value;
+      if (!playlistId || !targetModalTrack) {
+        alert("Wybierz playlistę!");
+        return;
+      }
+
+      const btn = document.getElementById('btnSubmitAddToPlaylist');
+      btn.disabled = true;
+      btn.textContent = '⏳ Dodawanie...';
+
+      try {
+        const res = await fetch(`${API_BASE}/library/playlists/${playlistId}/add-track`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: targetModalTrack.title || targetModalTrack.filename,
+            artist: targetModalTrack.artist || '',
+            rel_path: targetModalTrack.rel_path
+          })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`🎶 Dodano <b>${escapeHtml(targetModalTrack.title || targetModalTrack.filename)}</b> do playlisty!`);
+          closeAddToPlaylistModal();
+        } else {
+          alert(`Błąd: ${data.detail || 'Nie udało się dodać utworu do playlisty'}`);
+        }
+      } catch (err) {
+        alert(`Błąd połączenia: ${err}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '➕ Dodaj';
       }
     }
 
@@ -2379,6 +3001,50 @@ def web_dashboard():
       }
     }
   </script>
+
+  <!-- DOLNY MINI-ODTWARZACZ AUDIO -->
+  <div id="audioPlayerBar" class="audio-player-bar" style="display: none;">
+    <div style="display: flex; align-items: center; gap: 1rem; width: 100%; max-width: 900px; margin: 0 auto; flex-wrap: wrap;">
+      <div style="flex: 0 0 auto; display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; background: rgba(29, 185, 84, 0.2); border-radius: 50%; color: var(--primary); font-size: 1.3rem;">
+        🎵
+      </div>
+      <div style="min-width: 140px; flex: 1;">
+        <div id="playerTrackTitle" style="font-weight: 700; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #fff;">Tytuł utworu</div>
+        <div id="playerTrackArtist" style="font-size: 0.8rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Wykonawca • Album</div>
+      </div>
+      <div style="flex: 2; min-width: 200px; display: flex; align-items: center;">
+        <audio id="globalAudioPlayer" controls style="width: 100%; height: 36px; outline: none;"></audio>
+      </div>
+      <div style="flex: 0 0 auto;">
+        <button onclick="closeAudioPlayer()" style="background: transparent; border: none; color: var(--text-muted); font-size: 1.2rem; cursor: pointer; padding: 4px 8px; border-radius: 4px;" title="Zamknij odtwarzacz">✕</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: DODAJ UTWÓR DO PLAYLISTY -->
+  <div id="addToPlaylistModal" class="modal-overlay" style="display: none;">
+    <div class="modal-box">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 0.8rem;">
+        <h3 style="font-size: 1.1rem; font-weight: 700; color: #fff;">➕ Dodaj utwór do playlisty</h3>
+        <button onclick="closeAddToPlaylistModal()" style="background: transparent; border: none; color: var(--text-muted); font-size: 1.2rem; cursor: pointer;">✕</button>
+      </div>
+      <div style="margin-bottom: 1rem;">
+        <div style="font-size: 0.85rem; color: var(--text-muted);">Wybrany utwór:</div>
+        <div id="modalTrackTitle" style="font-weight: 700; font-size: 1rem; color: #fff; margin-top: 0.2rem;"></div>
+        <div id="modalTrackArtist" style="font-size: 0.85rem; color: var(--primary);"></div>
+      </div>
+      <div class="form-group" style="margin-bottom: 1.4rem;">
+        <label for="modalPlaylistSelect">Wybierz docelową playlistę w Navidrome:</label>
+        <select id="modalPlaylistSelect" style="width: 100%;">
+          <option value="" disabled selected>Ładowanie playlist...</option>
+        </select>
+      </div>
+      <div style="display: flex; justify-content: flex-end; gap: 0.8rem;">
+        <button class="btn-secondary" onclick="closeAddToPlaylistModal()">Anuluj</button>
+        <button class="btn-primary" id="btnSubmitAddToPlaylist" onclick="submitAddToPlaylist()">➕ Dodaj</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>
 """
