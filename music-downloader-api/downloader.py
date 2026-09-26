@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import shutil
 import logging
 import tempfile
@@ -493,6 +494,174 @@ class MusicDownloader:
         except Exception as e:
             logger.exception(f"Błąd podczas realizacji zadania custom tracks {task_id}: {e}")
             task_manager.update_task(task_id, status=TaskStatus.FAILED, error_message=str(e))
+
+    @staticmethod
+    def _format_seconds(seconds: Optional[float]) -> str:
+        if not seconds or seconds <= 0:
+            return ""
+        total = int(round(seconds))
+        m = total // 60
+        s = total % 60
+        return f"{m}:{s:02d}"
+
+    def search_youtube_versions(self, query: str, limit: int = 6) -> List[Dict[str, Any]]:
+        """
+        Wyszukuje alternatywne wersje utworu na YouTube (oficjalne audio, teledyski, koncerty itp.).
+        """
+        clean_q = query.strip()
+        if not clean_q:
+            return []
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "skip_download": True,
+        }
+
+        results = []
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                res = ydl.extract_info(f"ytsearch{limit}:{clean_q}", download=False)
+                entries = res.get("entries", []) if res else []
+                for entry in entries:
+                    if not entry:
+                        continue
+                    v_id = entry.get("id")
+                    title = entry.get("title") or "Bez tytułu"
+                    channel = entry.get("channel") or entry.get("uploader") or "Nieznany kanał"
+                    duration = entry.get("duration")
+                    thumbnails = entry.get("thumbnails") or []
+                    thumb_url = thumbnails[-1].get("url") if thumbnails else entry.get("thumbnail")
+                    is_topic = channel.lower().endswith("- topic") or "- topic" in channel.lower()
+
+                    results.append({
+                        "id": v_id,
+                        "title": title,
+                        "url": f"https://www.youtube.com/watch?v={v_id}" if v_id else entry.get("url"),
+                        "channel": channel,
+                        "duration": duration,
+                        "duration_str": self._format_seconds(duration),
+                        "thumbnail": thumb_url,
+                        "is_topic": is_topic
+                    })
+        except Exception as e:
+            logger.error(f"Błąd wyszukiwania wersji na YouTube dla '{query}': {e}")
+
+        return results
+
+    def get_audio_stream_url(self, query_or_url: str) -> Optional[str]:
+        """
+        Zwraca bezpośredni URL strumienia audio z YouTube do odsłuchu w przeglądarce.
+        Keszuje wyniki na 10 minut.
+        """
+        target = query_or_url.strip()
+        if not target:
+            return None
+
+        now = time.time()
+        if not hasattr(self, "_stream_cache"):
+            self._stream_cache = {}
+
+        if target in self._stream_cache:
+            cache_url, cache_time = self._stream_cache[target]
+            if now - cache_time < 600:
+                return cache_url
+
+        ydl_opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "socket_timeout": 15,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                to_extract = target if ("youtube.com" in target or "youtu.be" in target) else f"ytsearch1:{target}"
+                info = ydl.extract_info(to_extract, download=False)
+                if "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                stream_url = info.get("url")
+                if stream_url:
+                    self._stream_cache[target] = (stream_url, now)
+                    return stream_url
+        except Exception as e:
+            logger.error(f"Błąd pobierania stream URL dla '{query_or_url}': {e}")
+
+        return None
+
+    def replace_track(
+        self,
+        old_rel_path: str,
+        new_query_or_url: str,
+        audio_format: str = "opus",
+        custom_title: Optional[str] = None,
+        custom_artist: Optional[str] = None,
+        custom_album: Optional[str] = None
+    ) -> str:
+        """
+        Pobiera nową wersję utworu, usuwa stary plik z dysku i wywołuje odświeżenie indeksów.
+        """
+        music_dir_abs = os.path.abspath(self.music_dir)
+        old_full_path = os.path.abspath(os.path.join(music_dir_abs, old_rel_path.strip().lstrip("/\\")))
+        if not old_full_path.startswith(music_dir_abs):
+            raise ValueError(f"Nieprawidłowa ścieżka pliku: {old_rel_path}")
+
+        meta: Optional[TrackMetadata] = None
+        if spotify_manager.is_configured:
+            res_type, res_id = spotify_manager.parse_spotify_link(new_query_or_url)
+            if res_type == "track" and res_id:
+                meta = spotify_manager.get_track(res_id)
+            else:
+                meta = spotify_manager.find_best_track_match(new_query_or_url)
+
+        if not meta:
+            meta = TrackMetadata(
+                spotify_id=f"custom_{abs(hash(new_query_or_url))}",
+                title=custom_title or new_query_or_url,
+                artists=[custom_artist or "Various Artists"],
+                artist=custom_artist or "Various Artists",
+                album=custom_album or "Downloads",
+                album_artist=custom_artist or "Various Artists",
+                track_number=1,
+                total_tracks=1,
+                release_date="2026",
+                year="2026",
+                duration_ms=0,
+                spotify_url=new_query_or_url if "spotify.com" in new_query_or_url else ""
+            )
+
+        if custom_title:
+            meta.title = custom_title
+        if custom_artist:
+            meta.artist = custom_artist
+            meta.artists = [custom_artist]
+            meta.album_artist = custom_artist
+        if custom_album:
+            meta.album = custom_album
+
+        new_file_path = self.download_track(meta, audio_format=audio_format, force=True)
+
+        if os.path.isfile(old_full_path) and os.path.abspath(old_full_path) != os.path.abspath(new_file_path):
+            try:
+                os.remove(old_full_path)
+                logger.info(f"Usunięto stary podmieniony plik: {old_full_path}")
+                parent_dir = os.path.dirname(old_full_path)
+                while parent_dir != music_dir_abs and parent_dir.startswith(music_dir_abs):
+                    if not os.listdir(parent_dir):
+                        os.rmdir(parent_dir)
+                        parent_dir = os.path.dirname(parent_dir)
+                    else:
+                        break
+            except Exception as e:
+                logger.warning(f"Nie udało się usunąć starego pliku {old_full_path}: {e}")
+
+        duplicate_scanner.invalidate_cache()
+        library_checker.invalidate()
+        navidrome_client.trigger_scan(full_scan=False)
+
+        return new_file_path
 
 
 downloader = MusicDownloader()

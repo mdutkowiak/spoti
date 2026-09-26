@@ -134,3 +134,61 @@ class AudioTagger:
             logger.info(f"Otagowano plik MP3: {file_path}")
         except Exception as e:
             logger.error(f"Błąd podczas tagowania pliku MP3 ({file_path}): {e}")
+
+    @classmethod
+    def update_metadata(cls, file_path: str, title: str, artist: str, album: str) -> bool:
+        """
+        Aktualizuje tytuł, wykonawcę oraz album w istniejącym pliku audio,
+        zachowując nienaruszone okładki oraz pozostałe metadane.
+        """
+        ext = os.path.splitext(file_path)[1].lower()
+        try:
+            if ext == ".opus":
+                audio = OggOpus(file_path)
+                if title:
+                    audio["title"] = [title]
+                if artist:
+                    audio["artist"] = [artist]
+                    audio["albumartist"] = [artist]
+                if album:
+                    audio["album"] = [album]
+                audio.save()
+                logger.info(f"Zaktualizowano tagi Opus w: {file_path}")
+                return True
+
+            elif ext == ".flac":
+                audio = FLAC(file_path)
+                if title:
+                    audio["title"] = title
+                if artist:
+                    audio["artist"] = artist
+                    audio["albumartist"] = artist
+                if album:
+                    audio["album"] = album
+                audio.save()
+                logger.info(f"Zaktualizowano tagi FLAC w: {file_path}")
+                return True
+
+            elif ext in [".mp3", ".m4a"]:
+                try:
+                    tags = ID3(file_path)
+                except ID3NoHeaderError:
+                    tags = ID3()
+                if title:
+                    tags.add(TIT2(encoding=3, text=title))
+                if artist:
+                    tags.add(TPE1(encoding=3, text=artist))
+                    tags.add(TPE2(encoding=3, text=artist))
+                if album:
+                    tags.add(TALB(encoding=3, text=album))
+                tags.save(file_path, v2_version=3)
+                logger.info(f"Zaktualizowano tagi MP3 w: {file_path}")
+                return True
+
+            else:
+                logger.warning(f"Format {ext} nie jest obsługiwany do aktualizacji metadanych.")
+                return False
+
+        except Exception as e:
+            logger.error(f"Błąd aktualizacji tagów w {file_path}: {e}")
+            raise RuntimeError(f"Błąd zapisu tagów: {e}")

@@ -1,10 +1,11 @@
 import os
 import shutil
 import logging
+import requests
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Depends, Query
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 from config import settings
@@ -92,6 +93,22 @@ class AddTrackToPlaylistRequest(BaseModel):
     rel_path: Optional[str] = Field(default=None, description="Opcjonalna relatywna ścieżka pliku")
 
 
+class UpdateTrackMetadataRequest(BaseModel):
+    rel_path: str = Field(..., description="Ścieżka relatywna pliku w /music")
+    title: str = Field(..., description="Nowy tytuł utworu")
+    artist: str = Field(..., description="Nowy wykonawca")
+    album: str = Field(..., description="Nowy album")
+
+
+class ReplaceTrackRequest(BaseModel):
+    old_rel_path: str = Field(..., description="Ścieżka relatywna starego pliku")
+    new_query_or_url: str = Field(..., description="Link Spotify/YouTube lub tytuł nowej wersji")
+    audio_format: Optional[str] = Field(default="opus", description="Format audio")
+    custom_title: Optional[str] = Field(default=None)
+    custom_artist: Optional[str] = Field(default=None)
+    custom_album: Optional[str] = Field(default=None)
+
+
 class CreatePlaylistRequest(BaseModel):
     name: str = Field(..., description="Nazwa nowej playlisty")
     song_ids: Optional[List[str]] = Field(default=None, description="Opcjonalne ID utworów do dodania")
@@ -148,6 +165,74 @@ def search_music(
     except Exception as e:
         logger.error(f"Błąd wyszukiwania: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search/youtube", tags=["Downloader"])
+def search_youtube_versions(
+    q: str = Query(..., min_length=1, description="Szukana fraza na YouTube"),
+    limit: int = Query(6, ge=1, le=20),
+    _: bool = Depends(verify_api_key)
+):
+    """
+    Wyszukuje alternatywne wersje utworu bezpośrednio na YouTube (oficjalne audio, teledyski, koncerty).
+    """
+    try:
+        return {"query": q, "results": downloader.search_youtube_versions(q, limit=limit)}
+    except Exception as e:
+        logger.error(f"Błąd wyszukiwania YouTube: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/preview/audio", tags=["Downloader"])
+def preview_audio_stream(
+    request: Request,
+    url: Optional[str] = Query(None, description="Link YouTube lub Spotify"),
+    q: Optional[str] = Query(None, description="Tytuł / fraza do wyszukania audio"),
+    _: bool = Depends(verify_api_key)
+):
+    """
+    Strumieniuje audio z YouTube do przeglądarki z obsługą nagłówków Range (możliwość przewijania).
+    """
+    target = url or q
+    if not target:
+        raise HTTPException(status_code=400, detail="Brak parametru url lub q do odsłuchania.")
+
+    stream_url = downloader.get_audio_stream_url(target)
+    if not stream_url:
+        raise HTTPException(status_code=404, detail="Nie udało się uzyskać strumienia audio dla tego utworu.")
+
+    req_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    range_header = request.headers.get("range")
+    if range_header:
+        req_headers["Range"] = range_header
+
+    try:
+        resp = requests.get(stream_url, headers=req_headers, stream=True, timeout=15)
+        response_headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": resp.headers.get("Content-Type", "audio/mp4"),
+        }
+        if "Content-Range" in resp.headers:
+            response_headers["Content-Range"] = resp.headers["Content-Range"]
+        if "Content-Length" in resp.headers:
+            response_headers["Content-Length"] = resp.headers["Content-Length"]
+
+        def stream_chunks():
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    yield chunk
+
+        return StreamingResponse(
+            stream_chunks(),
+            status_code=resp.status_code,
+            headers=response_headers,
+            media_type=response_headers["Content-Type"]
+        )
+    except Exception as e:
+        logger.error(f"Błąd strumieniowania preview audio: {e}")
+        raise HTTPException(status_code=500, detail=f"Błąd strumieniowania: {e}")
 
 
 @app.post("/inspect", tags=["Downloader"])
@@ -363,6 +448,66 @@ def stream_audio(path: str = Query(...), _: bool = Depends(verify_api_key)):
         ".wav": "audio/wav"
     }
     return FileResponse(target_path, media_type=media_types.get(ext, "application/octet-stream"))
+
+
+@app.get("/library/cover", tags=["Library"])
+def get_library_cover(path: str = Query(...), _: bool = Depends(verify_api_key)):
+    """
+    Zwraca okładkę albumu z tagów pliku audio lub folderu.
+    """
+    img_bytes, mime = duplicate_scanner.get_track_cover(path)
+    if img_bytes and mime:
+        return Response(
+            content=img_bytes,
+            media_type=mime,
+            headers={"Cache-Control": "public, max-age=86400"}
+        )
+    svg_placeholder = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+        <rect width="100" height="100" fill="#1e293b"/>
+        <circle cx="50" cy="50" r="32" fill="#0f172a" stroke="#334155" stroke-width="3"/>
+        <circle cx="50" cy="50" r="10" fill="#1db954"/>
+        <path d="M50 35 v18 l12 -6 z" fill="#ffffff" opacity="0.9"/>
+    </svg>"""
+    return Response(content=svg_placeholder, media_type="image/svg+xml")
+
+
+@app.put("/library/tracks/metadata", tags=["Library"])
+def update_track_metadata(req: UpdateTrackMetadataRequest, _: bool = Depends(verify_api_key)):
+    """
+    Aktualizuje tagi (tytuł, wykonawca, album) w pliku audio i wywołuje odświeżenie Navidrome.
+    """
+    try:
+        res = duplicate_scanner.update_track_metadata(req.rel_path, req.title, req.artist, req.album)
+        library_checker.invalidate()
+        navidrome_client.trigger_scan(full_scan=False)
+        return {"status": "success", "message": "Zaktualizowano metadane utworu.", "track": res}
+    except Exception as e:
+        logger.error(f"Błąd aktualizacji metadanych: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/library/replace-track", tags=["Library"])
+def replace_library_track(req: ReplaceTrackRequest, _: bool = Depends(verify_api_key)):
+    """
+    Pobiera wybraną wersję utworu, bezpiecznie podmienia plik na dysku i odświeża bazę.
+    """
+    try:
+        new_path = downloader.replace_track(
+            old_rel_path=req.old_rel_path,
+            new_query_or_url=req.new_query_or_url,
+            audio_format=req.audio_format or settings.DEFAULT_AUDIO_FORMAT,
+            custom_title=req.custom_title,
+            custom_artist=req.custom_artist,
+            custom_album=req.custom_album
+        )
+        return {
+            "status": "success",
+            "message": "Pomyślnie podmieniono utwór na wybraną wersję.",
+            "new_path": new_path
+        }
+    except Exception as e:
+        logger.error(f"Błąd podmiany utworu: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # =============================================================================
@@ -1634,6 +1779,9 @@ def web_dashboard():
             ${durStr ? `<span class="badge-duration" title="Długość utworu">⏱️ ${durStr}</span>` : ''}
             ${inLib ? `<span class="badge-in-library" title="Ten utwór został już znaleziony w lokalnej bibliotece">⚠️ Ten utwór już jest w bazie</span>` : ''}
             <div style="display: flex; gap: 0.5rem; align-items: center; flex-shrink: 0; margin-left: auto;">
+              <button class="btn-secondary" onclick="playOnlinePreview(document.getElementById('artist-${idx}').value + ' ' + document.getElementById('title-${idx}').value, document.getElementById('title-${idx}').value, document.getElementById('artist-${idx}').value)" style="padding: 0.45rem 0.75rem; font-size: 0.82rem; white-space: nowrap;" title="Odsłuchaj fragment audio przed pobraniem">
+                ▶️ Odsłuchaj
+              </button>
               <button class="btn-search-version" id="search-btn-${idx}" onclick="lookupTrackVersions(${idx})" title="Wyszukaj ten utwór w katalogu, zobacz oficjalne albumy i wybierz wersję">
                 🔍 Wybierz wersję
               </button>
@@ -1736,9 +1884,14 @@ def web_dashboard():
                     </div>
                   </div>
                 </div>
-                <button class="download-small-btn" onclick="downloadVersionFromList(${idx}, decodeURIComponent('${encQ}'))" style="flex: 0 0 auto; width: max-content; margin-left: auto; padding: 0.45rem 0.85rem; font-size: 0.82rem; white-space: nowrap;">
-                  ⬇️ Pobierz tę wersję
-                </button>
+                <div style="display: flex; gap: 0.4rem; align-items: center; flex: 0 0 auto; margin-left: auto;">
+                  <button class="btn-secondary" onclick="playOnlinePreview(decodeURIComponent('${encQ}'), decodeURIComponent('${encodeURIComponent(item.title)}'), decodeURIComponent('${encodeURIComponent(item.artist)}'))" style="padding: 0.45rem 0.75rem; font-size: 0.82rem; white-space: nowrap;" title="Odsłuchaj fragment audio przed pobraniem">
+                    ▶️ Odsłuchaj
+                  </button>
+                  <button class="download-small-btn" onclick="downloadVersionFromList(${idx}, decodeURIComponent('${encQ}'))" style="flex: 0 0 auto; width: max-content; padding: 0.45rem 0.85rem; font-size: 0.82rem; white-space: nowrap;">
+                    ⬇️ Pobierz tę wersję
+                  </button>
+                </div>
               </div>
             `;
             }).join('')}
@@ -1970,9 +2123,14 @@ def web_dashboard():
                   </div>
                   <div class="track-artist">${escapeHtml(item.artist)} • ${escapeHtml(item.album)} (${escapeHtml(item.year || '')})</div>
                 </div>
-                <button class="download-small-btn" onclick="startDownload('${item.spotify_url || (item.artist + ' - ' + item.title)}')" style="width: max-content; flex: 0 0 auto; margin-left: auto;">
-                  ${inLib ? '⬇️ Pobierz ponownie' : '⬇️ Pobierz'}
-                </button>
+                <div style="display: flex; gap: 0.4rem; align-items: center; margin-left: auto; flex: 0 0 auto;">
+                  <button class="btn-secondary" onclick="playOnlinePreview(decodeURIComponent('${encodeURIComponent(item.spotify_url || (item.artist + ' - ' + item.title))}'), decodeURIComponent('${encodeURIComponent(item.title)}'), decodeURIComponent('${encodeURIComponent(item.artist)}'))" style="padding: 0.45rem 0.75rem; font-size: 0.82rem; white-space: nowrap;" title="Odsłuchaj fragment audio przed pobraniem">
+                    ▶️ Odsłuchaj
+                  </button>
+                  <button class="download-small-btn" onclick="startDownload('${item.spotify_url || (item.artist + ' - ' + item.title)}')" style="width: max-content; flex: 0 0 auto;">
+                    ${inLib ? '⬇️ Pobierz ponownie' : '⬇️ Pobierz'}
+                  </button>
+                </div>
               `;
             } else if (type === 'album') {
               const artists = (item.artists || []).join(', ');
@@ -2107,6 +2265,21 @@ def web_dashboard():
 
         selectedLibraryPaths.clear();
         updateSelectedLibraryCounter();
+
+        // Autocomplete dla wykonawców i albumów
+        if (data.all_artists && Array.isArray(data.all_artists)) {
+          const dlArt = document.getElementById('libraryArtistsDatalist');
+          if (dlArt) {
+            dlArt.innerHTML = data.all_artists.map(a => `<option value="${escapeHtml(a)}">`).join('');
+          }
+        }
+        if (data.all_albums && Array.isArray(data.all_albums)) {
+          const dlAlb = document.getElementById('libraryAlbumsDatalist');
+          if (dlAlb) {
+            dlAlb.innerHTML = data.all_albums.map(a => `<option value="${escapeHtml(a)}">`).join('');
+          }
+        }
+
         renderLibraryTracks();
       } catch (err) {
         sb.style.display = 'block';
@@ -2185,6 +2358,8 @@ def web_dashboard():
               ${isChecked ? 'checked' : ''}
               onchange="toggleLibraryTrackSelectByIndex(${idx}, this.checked)">
 
+            <img src="${API_BASE}/library/cover?path=${encodeURIComponent(t.rel_path)}" alt="cover" style="width: 50px; height: 50px; border-radius: 6px; object-fit: cover; background: #0f172a; border: 1px solid var(--border); flex-shrink: 0;" onerror="this.onerror=null; this.src='https://via.placeholder.com/50?text=♪';">
+
             <div style="flex: 1; min-width: 180px;">
               <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
                 <span class="${fmtClass}" style="font-size: 0.7rem; font-weight: 700; padding: 2px 6px; border-radius: 4px;">${t.format}</span>
@@ -2204,9 +2379,15 @@ def web_dashboard():
               <span>💾 ${t.size_str}</span>
             </div>
 
-            <div style="display: flex; gap: 0.4rem; align-items: center; flex: 0 0 auto;">
+            <div style="display: flex; gap: 0.4rem; align-items: center; flex: 0 0 auto; flex-wrap: wrap;">
               <button class="btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="playLibraryTrackByIndex(${idx})" title="Odsłuchaj w przeglądarce">
                 ${isPlaying ? '⏸️ Pauza' : '▶️ Odsłuchaj'}
+              </button>
+              <button class="btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="openEditMetadataModalByIndex(${idx})" title="Edytuj metadane utworu (tytuł, wykonawca, album)">
+                ✏️ Edytuj
+              </button>
+              <button class="btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="openReplaceTrackModalByIndex(${idx})" title="Podmień utwór na inną wersję">
+                🔄 Podmień
               </button>
               <button class="btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.8rem;" onclick="openAddToPlaylistModalByIndex(${idx})" title="Dodaj do playlisty Navidrome">
                 ➕ Do playlisty
@@ -3000,6 +3181,282 @@ def web_dashboard():
         alert(`Błąd: ${e}`);
       }
     }
+
+    // --- ODSŁUCH AUDIO ONLINE (PREVIEW) ---
+    function playOnlinePreview(queryOrUrl, title, artist) {
+      if (!queryOrUrl) return;
+      const playerBar = document.getElementById('audioPlayerBar');
+      const audio = document.getElementById('globalAudioPlayer');
+      const titleEl = document.getElementById('playerTrackTitle');
+      const artistEl = document.getElementById('playerTrackArtist');
+
+      currentPlayingPath = null;
+      titleEl.textContent = title || 'Podgląd audio';
+      artistEl.textContent = (artist || '') + ' (Streaming online)';
+
+      audio.src = `${API_BASE}/preview/audio?q=${encodeURIComponent(queryOrUrl)}`;
+      playerBar.style.display = 'block';
+      audio.play().catch(e => console.log('Autoplay prevented:', e));
+
+      renderLibraryTracks();
+    }
+
+    // --- EDYCJA METADANYCH UTWORU ---
+    let currentEditTrack = null;
+
+    function openEditMetadataModalByIndex(idx) {
+      const track = filteredLibraryTracks[idx];
+      if (!track) return;
+      currentEditTrack = track;
+
+      document.getElementById('editModalCover').src = `${API_BASE}/library/cover?path=${encodeURIComponent(track.rel_path)}`;
+      document.getElementById('editModalOriginalPath').textContent = track.rel_path;
+      document.getElementById('editTrackTitle').value = track.title || '';
+      document.getElementById('editTrackArtist').value = track.artist || '';
+      document.getElementById('editTrackAlbum').value = track.album || '';
+
+      document.getElementById('editMetadataModal').style.display = 'flex';
+    }
+
+    function closeEditMetadataModal() {
+      document.getElementById('editMetadataModal').style.display = 'none';
+      currentEditTrack = null;
+    }
+
+    async function submitSaveMetadata() {
+      if (!currentEditTrack) return;
+      const title = document.getElementById('editTrackTitle').value.trim();
+      const artist = document.getElementById('editTrackArtist').value.trim();
+      const album = document.getElementById('editTrackAlbum').value.trim();
+
+      const btn = document.getElementById('btnSaveMetadata');
+      btn.disabled = true;
+      btn.textContent = '⏳ Zapisywanie...';
+
+      try {
+        const res = await fetch(`${API_BASE}/library/tracks/metadata`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            rel_path: currentEditTrack.rel_path,
+            title: title,
+            artist: artist,
+            album: album
+          })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`💾 Zaktualizowano metadane: <b>${escapeHtml(title || currentEditTrack.filename)}</b>`);
+          closeEditMetadataModal();
+          loadLibraryTracks();
+        } else {
+          alert(`Błąd zapisu metadanych: ${data.detail || 'Nieznany błąd'}`);
+        }
+      } catch (err) {
+        alert(`Błąd połączenia: ${err}`);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '💾 Zapisz zmiany';
+      }
+    }
+
+    // --- PODMIANA UTWORU (REPLACE TRACK) ---
+    let currentReplaceTrack = null;
+    let replaceSearchMode = 'spotify';
+
+    function openReplaceTrackModalByIndex(idx) {
+      const track = filteredLibraryTracks[idx];
+      if (!track) return;
+      currentReplaceTrack = track;
+
+      document.getElementById('replaceModalCurrentCover').src = `${API_BASE}/library/cover?path=${encodeURIComponent(track.rel_path)}`;
+      document.getElementById('replaceModalCurrentTitle').textContent = track.title || track.filename;
+      document.getElementById('replaceModalCurrentArtist').textContent = track.artist || 'Nieznany wykonawca';
+      document.getElementById('replaceModalCurrentMeta').textContent = `${track.album || 'Brak albumu'} • ${track.format || ''} • ${track.duration_str || ''}`;
+
+      const defaultQuery = `${track.artist || ''} ${track.title || ''}`.trim() || track.title || track.filename;
+      document.getElementById('replaceSearchInput').value = defaultQuery;
+
+      switchReplaceSearchMode('spotify', false);
+      document.getElementById('replaceSearchResults').innerHTML = `
+        <div style="text-align: center; padding: 2rem; color: var(--text-muted); font-size: 0.85rem;">
+          Wpisz tytuł lub wykonawcę i kliknij „🔍 Szukaj”, aby znaleźć alternatywne wersje.
+        </div>
+      `;
+      document.getElementById('replaceSearchStatus').style.display = 'none';
+      document.getElementById('replaceTrackModal').style.display = 'flex';
+
+      if (defaultQuery) {
+        searchReplaceVersions();
+      }
+    }
+
+    function closeReplaceTrackModal() {
+      document.getElementById('replaceTrackModal').style.display = 'none';
+      currentReplaceTrack = null;
+    }
+
+    function switchReplaceSearchMode(mode, doSearch = true) {
+      replaceSearchMode = mode;
+      const btnSpo = document.getElementById('btnReplaceTabSpotify');
+      const btnYt = document.getElementById('btnReplaceTabYouTube');
+
+      if (mode === 'spotify') {
+        btnSpo.style.background = '#1e293b';
+        btnSpo.style.borderColor = 'var(--primary)';
+        btnSpo.style.color = '#fff';
+        btnYt.style.background = 'transparent';
+        btnYt.style.borderColor = 'var(--border)';
+        btnYt.style.color = 'var(--text-muted)';
+      } else {
+        btnYt.style.background = '#1e293b';
+        btnYt.style.borderColor = '#ef4444';
+        btnYt.style.color = '#fff';
+        btnSpo.style.background = 'transparent';
+        btnSpo.style.borderColor = 'var(--border)';
+        btnSpo.style.color = 'var(--text-muted)';
+      }
+
+      if (doSearch && document.getElementById('replaceSearchInput').value.trim()) {
+        searchReplaceVersions();
+      }
+    }
+
+    async function searchReplaceVersions() {
+      const q = document.getElementById('replaceSearchInput').value.trim();
+      const resultsEl = document.getElementById('replaceSearchResults');
+      const statusEl = document.getElementById('replaceSearchStatus');
+      if (!q) return;
+
+      resultsEl.innerHTML = `<div style="text-align: center; padding: 2rem; color: var(--text-muted); font-size: 0.85rem;">⏳ Wyszukiwanie wersji (${replaceSearchMode === 'spotify' ? 'Spotify' : 'YouTube'})...</div>`;
+      statusEl.style.display = 'none';
+
+      try {
+        if (replaceSearchMode === 'spotify') {
+          const res = await fetch(`${API_BASE}/search?q=${encodeURIComponent(q)}&type=track&limit=6`);
+          const data = await res.json();
+          if (!res.ok || !data.results || data.results.length === 0) {
+            resultsEl.innerHTML = `<div style="text-align: center; padding: 2rem; color: #f59e0b; font-size: 0.85rem;">⚠️ Nie znaleziono pasujących utworów w katalogu Spotify. Spróbuj zmienić zapytanie lub przełącz na zakładkę YouTube.</div>`;
+            return;
+          }
+
+          resultsEl.innerHTML = data.results.map(item => {
+            const durStr = formatDuration(item.duration_ms);
+            const inLib = Boolean(item.in_library);
+            const targetUrl = item.spotify_url || `${item.artist} - ${item.title}`;
+            const encTarget = encodeURIComponent(targetUrl);
+            const prevQ = encodeURIComponent(`${item.artist} - ${item.title}`);
+
+            return `
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; padding: 0.7rem; background: #0f172a; border-radius: 8px; border: 1px solid var(--border);">
+                <div style="display: flex; align-items: center; gap: 0.7rem; min-width: 0; flex: 1;">
+                  <img src="${item.cover_url || 'https://via.placeholder.com/48'}" alt="cover" style="width: 48px; height: 48px; border-radius: 6px; object-fit: cover; background: #1e293b; border: 1px solid var(--border); flex-shrink: 0;">
+                  <div style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                      <span style="font-weight: 600; font-size: 0.9rem; color: #fff;">${escapeHtml(item.title)}</span>
+                      ${durStr ? `<span class="badge-duration" style="font-size: 0.72rem; padding: 2px 6px;">⏱️ ${durStr}</span>` : ''}
+                      ${inLib ? `<span class="badge-in-library" style="font-size: 0.72rem; padding: 2px 6px;">⚠️ Obecny w bazie</span>` : ''}
+                    </div>
+                    <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis;">
+                      ${escapeHtml(item.artist)} • <b style="color: #cbd5e1;">${escapeHtml(item.album)}</b> (${escapeHtml(item.year || '')})
+                    </div>
+                  </div>
+                </div>
+                <div style="display: flex; gap: 0.4rem; align-items: center; flex: 0 0 auto;">
+                  <button class="btn-secondary" onclick="playOnlinePreview(decodeURIComponent('${prevQ}'), decodeURIComponent('${encodeURIComponent(item.title)}'), decodeURIComponent('${encodeURIComponent(item.artist)}'))" style="padding: 0.4rem 0.7rem; font-size: 0.8rem; white-space: nowrap;" title="Odsłuchaj fragment audio">
+                    ▶️ Odsłuchaj
+                  </button>
+                  <button class="btn-primary" onclick="confirmReplaceTrack('${encTarget}', decodeURIComponent('${encodeURIComponent(item.title)}'), decodeURIComponent('${encodeURIComponent(item.artist)}'), decodeURIComponent('${encodeURIComponent(item.album)}'))" style="padding: 0.4rem 0.85rem; font-size: 0.8rem; white-space: nowrap; width: auto;">
+                    🔄 Podmień
+                  </button>
+                </div>
+              </div>
+            `;
+          }).join('');
+
+        } else {
+          // YouTube
+          const res = await fetch(`${API_BASE}/search/youtube?q=${encodeURIComponent(q)}&limit=6`);
+          const data = await res.json();
+          if (!res.ok || !data.results || data.results.length === 0) {
+            resultsEl.innerHTML = `<div style="text-align: center; padding: 2rem; color: #f59e0b; font-size: 0.85rem;">⚠️ Nie znaleziono pasujących filmów/nagrań na YouTube.</div>`;
+            return;
+          }
+
+          resultsEl.innerHTML = data.results.map(item => {
+            const durStr = formatDuration(item.duration_seconds ? item.duration_seconds * 1000 : null);
+            const targetUrl = item.webpage_url || item.url;
+            const encTarget = encodeURIComponent(targetUrl);
+
+            return `
+              <div style="display: flex; align-items: center; justify-content: space-between; gap: 0.8rem; padding: 0.7rem; background: #0f172a; border-radius: 8px; border: 1px solid var(--border);">
+                <div style="display: flex; align-items: center; gap: 0.7rem; min-width: 0; flex: 1;">
+                  <img src="${item.thumbnail || 'https://via.placeholder.com/48'}" alt="thumb" style="width: 56px; height: 42px; border-radius: 6px; object-fit: cover; background: #1e293b; border: 1px solid var(--border); flex-shrink: 0;">
+                  <div style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;">
+                    <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                      <span style="font-weight: 600; font-size: 0.88rem; color: #fff;">${escapeHtml(item.title)}</span>
+                      ${durStr ? `<span class="badge-duration" style="font-size: 0.72rem; padding: 2px 6px;">⏱️ ${durStr}</span>` : ''}
+                    </div>
+                    <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis;">
+                      Kanał: <b style="color: #cbd5e1;">${escapeHtml(item.uploader || 'YouTube')}</b>
+                    </div>
+                  </div>
+                </div>
+                <div style="display: flex; gap: 0.4rem; align-items: center; flex: 0 0 auto;">
+                  <button class="btn-secondary" onclick="playOnlinePreview(decodeURIComponent('${encTarget}'), decodeURIComponent('${encodeURIComponent(item.title)}'), decodeURIComponent('${encodeURIComponent(item.uploader || '')}'))" style="padding: 0.4rem 0.7rem; font-size: 0.8rem; white-space: nowrap;" title="Odsłuchaj fragment audio">
+                    ▶️ Odsłuchaj
+                  </button>
+                  <button class="btn-primary" onclick="confirmReplaceTrack('${encTarget}', decodeURIComponent('${encodeURIComponent(item.title)}'), decodeURIComponent('${encodeURIComponent(item.uploader || '')}'), '')" style="padding: 0.4rem 0.85rem; font-size: 0.8rem; white-space: nowrap; width: auto;">
+                    🔄 Podmień
+                  </button>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+      } catch (err) {
+        resultsEl.innerHTML = `<div style="text-align: center; padding: 2rem; color: #ef4444; font-size: 0.85rem;">Błąd wyszukiwania: ${err}</div>`;
+      }
+    }
+
+    async function confirmReplaceTrack(encUrl, title, artist, album) {
+      if (!currentReplaceTrack) return;
+      const targetUrl = decodeURIComponent(encUrl);
+      const conf = confirm(`Czy na pewno chcesz podmienić utwór:\n"${currentReplaceTrack.title || currentReplaceTrack.filename}"\n\nna wersję:\n"${title}" (${artist})?\n\nDotychczasowy plik zostanie usunięty i zastąpiony nowym audio.`);
+      if (!conf) return;
+
+      const statusEl = document.getElementById('replaceSearchStatus');
+      statusEl.className = 'status-box';
+      statusEl.style.display = 'block';
+      statusEl.innerHTML = `⏳ Rozpoczynanie pobierania nowej wersji i podmiany pliku... To może potrwać kilkanaście sekund.`;
+
+      try {
+        const res = await fetch(`${API_BASE}/library/replace-track`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            old_rel_path: currentReplaceTrack.rel_path,
+            new_query_or_url: targetUrl,
+            audio_format: currentReplaceTrack.format ? currentReplaceTrack.format.toLowerCase() : 'opus',
+            custom_title: title || undefined,
+            custom_artist: artist || undefined,
+            custom_album: album || undefined
+          })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(`✅ Pomyślnie podmieniono utwór na: <b>${escapeHtml(title)}</b>`);
+          closeReplaceTrackModal();
+          loadLibraryTracks();
+        } else {
+          statusEl.className = 'status-box error';
+          statusEl.innerHTML = `❌ Błąd podmiany: ${data.detail || 'Nieznany błąd'}`;
+        }
+      } catch (err) {
+        statusEl.className = 'status-box error';
+        statusEl.innerHTML = `❌ Błąd połączenia: ${err}`;
+      }
+    }
   </script>
 
   <!-- DOLNY MINI-ODTWARZACZ AUDIO -->
@@ -3045,6 +3502,96 @@ def web_dashboard():
       </div>
     </div>
   </div>
+
+  <!-- MODAL: EDYCJA METADANYCH UTWORU -->
+  <div id="editMetadataModal" class="modal-overlay" style="display: none;">
+    <div class="modal-box">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 0.8rem;">
+        <h3 style="font-size: 1.15rem; font-weight: 700; color: #fff;">✏️ Edycja metadanych utworu</h3>
+        <button onclick="closeEditMetadataModal()" style="background: transparent; border: none; color: var(--text-muted); font-size: 1.2rem; cursor: pointer;">✕</button>
+      </div>
+
+      <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1.2rem; background: #0f172a; padding: 0.8rem; border-radius: 8px; border: 1px solid var(--border);">
+        <img id="editModalCover" src="" style="width: 56px; height: 56px; border-radius: 6px; object-fit: cover; background: #1e293b; border: 1px solid var(--border);">
+        <div style="min-width: 0; flex: 1;">
+          <div id="editModalOriginalPath" style="font-size: 0.75rem; color: #64748b; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;"></div>
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.2rem;">Zmień tytuł, wykonawcę (np. latynizacja japońskich nazw) oraz album. Zmiany zostaną zapisane w tagach pliku audio.</div>
+        </div>
+      </div>
+
+      <div class="form-group" style="margin-bottom: 1rem;">
+        <label for="editTrackTitle">Tytuł utworu:</label>
+        <input type="text" id="editTrackTitle" placeholder="np. Tytuł zromanizowany lub przetłumaczony" style="width: 100%;">
+      </div>
+
+      <div class="form-group" style="margin-bottom: 1rem;">
+        <label for="editTrackArtist">Wykonawca (wpisz lub wybierz z listy):</label>
+        <input type="text" id="editTrackArtist" list="libraryArtistsDatalist" placeholder="np. Hanabie, Ado..." style="width: 100%;">
+      </div>
+
+      <div class="form-group" style="margin-bottom: 1.4rem;">
+        <label for="editTrackAlbum">Album (wpisz lub wybierz z listy):</label>
+        <input type="text" id="editTrackAlbum" list="libraryAlbumsDatalist" placeholder="np. Nazwa albumu..." style="width: 100%;">
+      </div>
+
+      <div style="display: flex; justify-content: flex-end; gap: 0.8rem;">
+        <button class="btn-secondary" onclick="closeEditMetadataModal()">Anuluj</button>
+        <button class="btn-primary" id="btnSaveMetadata" onclick="submitSaveMetadata()">💾 Zapisz zmiany</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: PODMIANA UTWORU -->
+  <div id="replaceTrackModal" class="modal-overlay" style="display: none;">
+    <div class="modal-box" style="max-width: 680px; max-height: 90vh; overflow-y: auto;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 0.8rem;">
+        <h3 style="font-size: 1.15rem; font-weight: 700; color: #fff;">🔄 Podmień utwór na inną wersję</h3>
+        <button onclick="closeReplaceTrackModal()" style="background: transparent; border: none; color: var(--text-muted); font-size: 1.2rem; cursor: pointer;">✕</button>
+      </div>
+
+      <!-- Aktualny utwór -->
+      <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1.2rem; background: #0f172a; padding: 0.8rem; border-radius: 8px; border: 1px solid var(--border);">
+        <img id="replaceModalCurrentCover" src="" style="width: 58px; height: 58px; border-radius: 6px; object-fit: cover; background: #1e293b; border: 1px solid var(--border);">
+        <div style="min-width: 0; flex: 1;">
+          <div style="font-size: 0.72rem; text-transform: uppercase; color: #ef4444; font-weight: 700;">Aktualnie w bibliotece (do zastąpienia):</div>
+          <div id="replaceModalCurrentTitle" style="font-weight: 700; font-size: 0.95rem; color: #fff; margin-top: 0.1rem;"></div>
+          <div id="replaceModalCurrentArtist" style="font-size: 0.82rem; color: var(--text-muted);"></div>
+          <div id="replaceModalCurrentMeta" style="font-size: 0.75rem; color: #64748b; margin-top: 0.15rem;"></div>
+        </div>
+      </div>
+
+      <!-- Wyszukiwarka nowej wersji -->
+      <div class="form-group" style="margin-bottom: 0.8rem;">
+        <label for="replaceSearchInput">Szukaj innej wersji utworu (Spotify / YouTube):</label>
+        <div style="display: flex; gap: 0.6rem;">
+          <input type="text" id="replaceSearchInput" placeholder="Wpisz nazwę lub wklej link ze Spotify / YouTube" onkeydown="if(event.key==='Enter') searchReplaceVersions()">
+          <button class="btn-primary" style="flex: 0 0 auto; width: auto; padding: 0 1.2rem;" onclick="searchReplaceVersions()">🔍 Szukaj</button>
+        </div>
+      </div>
+
+      <div style="display: flex; gap: 0.6rem; margin-bottom: 1rem;">
+        <button class="btn-secondary" id="btnReplaceTabSpotify" onclick="switchReplaceSearchMode('spotify')" style="padding: 0.4rem 0.85rem; font-size: 0.82rem; background: #1e293b; border-color: var(--primary);">🟢 Spotify (Wydania studyjne)</button>
+        <button class="btn-secondary" id="btnReplaceTabYouTube" onclick="switchReplaceSearchMode('youtube')" style="padding: 0.4rem 0.85rem; font-size: 0.82rem;">🔴 YouTube (Konkretne wideo / audio)</button>
+      </div>
+
+      <div id="replaceSearchStatus" class="status-box" style="display: none; margin-bottom: 1rem;"></div>
+
+      <!-- Lista znalezionych wersji -->
+      <div id="replaceSearchResults" style="display: flex; flex-direction: column; gap: 0.6rem; max-height: 380px; overflow-y: auto; padding-right: 4px;">
+        <div style="text-align: center; padding: 2rem; color: var(--text-muted); font-size: 0.85rem;">
+          Wpisz tytuł lub wykonawcę i kliknij „🔍 Szukaj”, aby znaleźć alternatywne wersje.
+        </div>
+      </div>
+
+      <div style="display: flex; justify-content: flex-end; margin-top: 1.2rem; border-top: 1px solid var(--border); padding-top: 0.8rem;">
+        <button class="btn-secondary" onclick="closeReplaceTrackModal()">Zamknij</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- LISTY AUTOCOMPLETE DLA AUTORÓW I ALBUMÓW -->
+  <datalist id="libraryArtistsDatalist"></datalist>
+  <datalist id="libraryAlbumsDatalist"></datalist>
 </body>
 </html>
 """

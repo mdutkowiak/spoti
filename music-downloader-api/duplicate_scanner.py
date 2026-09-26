@@ -2,7 +2,7 @@ import os
 import re
 import time
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
 from config import settings
 
 logger = logging.getLogger("music-downloader.scanner")
@@ -284,8 +284,8 @@ class DuplicateScanner:
         audio_exts = {".opus", ".mp3", ".flac", ".m4a", ".ogg", ".wav"}
         tracks: List[Dict[str, Any]] = []
         total_size = 0
-        artists = set()
-        albums = set()
+        artists_dict: Dict[str, str] = {}
+        albums_dict: Dict[str, str] = {}
 
         try:
             for root, _, files in os.walk(self.music_dir):
@@ -298,26 +298,101 @@ class DuplicateScanner:
                         tracks.append(meta)
                         total_size += meta["size_bytes"]
                         if meta["artist"] and meta["artist"] != "Nieznany wykonawca":
-                            artists.add(meta["artist"].lower().strip())
+                            artists_dict[meta["artist"].lower().strip()] = meta["artist"].strip()
                         if meta["album"] and meta["album"] != "Brak albumu":
-                            albums.add(meta["album"].lower().strip())
+                            albums_dict[meta["album"].lower().strip()] = meta["album"].strip()
         except Exception as e:
             logger.error(f"Błąd skanowania biblioteki utworów: {e}")
 
         # Domyślnie posortowane od najnowszych
         tracks.sort(key=lambda t: t["mtime"], reverse=True)
 
+        sorted_artists = sorted(artists_dict.values(), key=lambda s: s.lower())
+        sorted_albums = sorted(albums_dict.values(), key=lambda s: s.lower())
+
         data = {
             "total_tracks": len(tracks),
             "total_size_bytes": total_size,
             "total_size_str": self._format_bytes(total_size),
-            "total_artists": len(artists),
-            "total_albums": len(albums),
+            "total_artists": len(sorted_artists),
+            "total_albums": len(sorted_albums),
+            "all_artists": sorted_artists,
+            "all_albums": sorted_albums,
             "tracks": tracks
         }
         self._tracks_cache = data
         self._tracks_cache_time = now
         return data
+
+    def get_track_cover(self, rel_path: str) -> Tuple[Optional[bytes], Optional[str]]:
+        """
+        Zwraca dane binarne okładki oraz typ MIME (np. image/jpeg, image/png).
+        Najpierw próbuje odczytać wbudowaną okładkę z tagów (Opus, FLAC, MP3),
+        a jeśli jej nie ma, przeszukuje folder utworu pod kątem plików cover/folder.jpg.
+        """
+        music_dir_abs = os.path.abspath(self.music_dir)
+        target_path = os.path.abspath(os.path.join(music_dir_abs, rel_path.strip().lstrip("/\\")))
+        if not target_path.startswith(music_dir_abs) or not os.path.isfile(target_path):
+            return None, None
+
+        ext = os.path.splitext(target_path)[1].lower()
+
+        # 1. Próba odczytu okładki osadzonej wewnątrz pliku audio
+        try:
+            if ext == ".opus":
+                from mutagen.oggopus import OggOpus
+                from mutagen.flac import Picture
+                import base64
+                audio = OggOpus(target_path)
+                pics = audio.get("metadata_block_picture", [])
+                if pics:
+                    raw = base64.b64decode(pics[0])
+                    pic = Picture(raw)
+                    return pic.data, (pic.mime or "image/jpeg")
+
+            elif ext == ".flac":
+                from mutagen.flac import FLAC
+                audio = FLAC(target_path)
+                if audio.pictures:
+                    pic = audio.pictures[0]
+                    return pic.data, (pic.mime or "image/jpeg")
+
+            elif ext in [".mp3", ".m4a"]:
+                from mutagen.id3 import ID3
+                tags = ID3(target_path)
+                for tag in tags.values():
+                    if getattr(tag, "FrameID", None) == "APIC":
+                        return tag.data, (tag.mime or "image/jpeg")
+        except Exception as e:
+            logger.debug(f"Błąd odczytu wbudowanej okładki z {rel_path}: {e}")
+
+        # 2. Sprawdzenie plików graficznych w katalogu albumu
+        try:
+            folder = os.path.dirname(target_path)
+            for name in ["cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.jpeg", "folder.png", "front.jpg"]:
+                cand = os.path.join(folder, name)
+                if os.path.isfile(cand):
+                    mime = "image/png" if cand.lower().endswith(".png") else "image/jpeg"
+                    with open(cand, "rb") as f:
+                        return f.read(), mime
+        except Exception as e:
+            logger.debug(f"Błąd odczytu okładki z katalogu {folder}: {e}")
+
+        return None, None
+
+    def update_track_metadata(self, rel_path: str, title: str, artist: str, album: str) -> Dict[str, Any]:
+        """
+        Zapisuje nowe tagi w pliku na dysku i unieważnia pamięć podręczną.
+        """
+        music_dir_abs = os.path.abspath(self.music_dir)
+        target_path = os.path.abspath(os.path.join(music_dir_abs, rel_path.strip().lstrip("/\\")))
+        if not target_path.startswith(music_dir_abs) or not os.path.isfile(target_path):
+            raise FileNotFoundError(f"Plik nie istnieje: {rel_path}")
+
+        from tagger import AudioTagger
+        AudioTagger.update_metadata(target_path, title=title, artist=artist, album=album)
+        self.invalidate_cache()
+        return self._read_file_metadata(target_path, rel_path)
 
 
 duplicate_scanner = DuplicateScanner(settings.MUSIC_DIR)
